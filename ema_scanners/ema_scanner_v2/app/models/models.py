@@ -60,3 +60,33 @@ class Signal(Base):
 
     def __repr__(self):
         return f"<Signal {self.symbol} {self.market} {self.signal_type} @ {self.cross_time}>"
+
+
+class ImportedSignal(Base):
+    """Signals uploaded via the CSV Backtest page — kept entirely separate
+    from the scanner's own `signals` table so an import can never interfere
+    with live EMA-detection state (_signal_symbols(), latest-signal lookups,
+    etc. all read only from `Signal`). Each new CSV upload replaces the
+    previous import wholesale (see csv_import.py) rather than accumulating."""
+    __tablename__ = "imported_signals"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    symbol      = Column(String(20), nullable=False, index=True)
+    market      = Column(String(10), nullable=False, default="futures")
+    interval    = Column(String(5),  nullable=False, default="1h")
+    signal_type = Column(String(4),  nullable=False)       # BUY | SELL
+    cross_price = Column(Float,      nullable=True)        # optional — CSV may not include it
+    cross_time  = Column(DateTime(timezone=True), nullable=False)
+    # Optional extra columns carried straight from the CSV (if present) so the
+    # scanner-style display doesn't need to recompute them — this is exactly
+    # the same info the CSV's own EMA Fast/Mid/Slow and Score columns give us.
+    # (The CSV's own "Price" column is stored in `cross_price` above — no
+    # separate column needed for that.)
+    ema_fast    = Column(Float, nullable=True)
+    ema_mid     = Column(Float, nullable=True)
+    ema_slow    = Column(Float, nullable=True)
+    score       = Column(Float, nullable=True)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())
+
+    def __repr__(self):
+        return f"<ImportedSignal {self.symbol} {self.signal_type} @ {self.cross_time}>"

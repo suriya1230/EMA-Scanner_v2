@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
-import { TrendingUp, TrendingDown, Target, Database, CheckCircle2, XCircle, DollarSign, Award } from "lucide-react";
+import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
+import { TrendingUp, TrendingDown, Target, Database, CheckCircle2, XCircle, DollarSign, Award, CalendarClock } from "lucide-react";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api";
@@ -349,7 +349,7 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
         tradeSignal: type, signalTime, entryTime, entryPrice, stopLoss, targetPrice,
         entryClose: null, entryCloseTime: null, exitReason: "Open", duration: "—",
         result: "OPEN", gainPct: null, gainAmount: null, gainDollar: null,
-        _entryTimeMs: entryTimeMs, _exitTimeMs: null,
+        _entryTimeMs: entryTimeMs, _exitTimeMs: null, _signalTimeMs: crossTimeMs,
       };
       trades.push(row);
       openTradeRef = row;
@@ -370,7 +370,7 @@ function runBacktestFromSignals(candles, dbSignals, rrMode, windowDays, candleMs
       tradeSignal: type, signalTime, entryTime, entryPrice, stopLoss, targetPrice,
       entryClose: exitPrice, entryCloseTime: fmtDateTime(exitTimeMs), exitReason,
       duration, result, gainPct, gainAmount, gainDollar,
-      _entryTimeMs: entryTimeMs, _exitTimeMs: exitTimeMs,
+      _entryTimeMs: entryTimeMs, _exitTimeMs: exitTimeMs, _signalTimeMs: crossTimeMs,
     });
     openTradeRef = null;
   }
@@ -399,74 +399,203 @@ const SCOLS = [
   {k:"details",  l:"Details",      s:false},
 ];
 
-function ScannerPage({ market, setMarket, onDetails, onBacktest, onScreenerBacktest }) {
-  const [rows, setRows] = useState([]);
-  const [status, setStatus] = useState(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [sig, setSig] = useState("All");
-  const [trend, setTrend] = useState("All");
-  const [search, setSearch] = useState("");
-  const [sort, setSort] = useState({ k:"signal_time", dir:"desc" });
+// Runs `worker` over `items` with at most `limit` in flight at once — a CSV
+// can reference hundreds of distinct (symbol, interval) pairs, and firing
+// that many fetches all at once (unbounded Promise.all) queues up behind the
+// browser's per-host connection cap and makes page load look stuck.
+async function runWithConcurrency(items, worker, limit) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function runOne() {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await worker(items[idx], idx);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runOne));
+  return results;
+}
+const CSV_CANDLE_CONCURRENCY = 15;
+// Rendering all rows as real DOM nodes (thousands of <tr>, each with hover
+// handlers) is what made every click/scroll janky — paginating keeps the
+// live DOM small regardless of how many rows match the current filters.
+const CSV_PAGE_SIZE = 50;
+
+function ScannerPageImpl({ onBacktest, onScreenerBacktest }) {
   const [modal, setModal] = useState(null);
-  const [updated, setUpdated] = useState(null);
-  const [nowTick, setNowTick] = useState(null);
-  const intRef = useRef(null);
+  const [csvUploading, setCsvUploading] = useState(false);
+  const [csvUploadError, setCsvUploadError] = useState(null);
+  const csvInputRef = useRef(null);
 
-  useEffect(() => {
-    const id = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
-  const scannedAgoSec = (updated && nowTick) ? Math.max(0, Math.floor((nowTick - updated.getTime()) / 1000)) : null;
+  // CSV Backtest — all inline on this page, no separate page/navigation.
+  // Displayed as a scanner-style table (same columns/components as the main
+  // table above), not a trade-result table — each CSV row can be on its own
+  // timeframe (5m/15m/30m/1h/...), shown as a small tag next to Signal Time.
+  const [csvSummary, setCsvSummary] = useState(null);
+  const [csvRows, setCsvRows] = useState([]);
+  const [csvLoading, setCsvLoading] = useState(false);
+  const [csvError, setCsvError] = useState(null);
+  const [csvSort, setCsvSort] = useState({ k:"signal_time", dir:"desc" });
+  const [csvSearch, setCsvSearch] = useState("");
+  const [csvTrendFilter, setCsvTrendFilter] = useState("All");
+  const [csvSigFilter, setCsvSigFilter] = useState("All");
+  const [csvPage, setCsvPage] = useState(1);
+  const csvFetchIdRef = useRef(0);
 
-  const fetchData = useCallback(async () => {
+  const loadCsvRows = useCallback(async () => {
+    const requestId = ++csvFetchIdRef.current;
+    setCsvLoading(true);
+    setCsvError(null);
     try {
-      const p = new URLSearchParams({ limit:500, market });
-      if (sig !== "All") p.set("signal", sig);
-      const [sr, str] = await Promise.all([
-        fetch(`${API_BASE}/scanner?${p}`),
-        fetch(`${API_BASE}/status?market=${market}`),
-      ]);
-      if (!sr.ok) throw new Error(`API ${sr.status}`);
-      const sd = await sr.json();
-      const std = str.ok ? await str.json() : null;
-      setRows(sd.data || []);
-      setStatus(std);
-      setUpdated(new Date());
-      setError(null);
-    } catch (e) { setError(e.message); }
-    finally { setLoading(false); }
-  }, [sig, market]);
+      const sigRes = await fetch(`${API_BASE}/csv-signals`);
+      if (!sigRes.ok) throw new Error(`API ${sigRes.status}`);
+      const rawSignals = await sigRes.json();
 
+      // Each (symbol, timeframe) pair needs its own candle fetch — a CSV can
+      // mix timeframes per row, unlike the rest of this app.
+      const byPair = new Map();
+      for (const s of rawSignals) {
+        const key = `${s.symbol}|${s.interval}`;
+        if (!byPair.has(key)) byPair.set(key, []);
+        byPair.get(key).push(s);
+      }
+
+      const nowMs = Date.now();
+      const pairCandles = new Map();
+      await runWithConcurrency([...byPair.keys()], async key => {
+        const [symbol, interval] = key.split("|");
+        // Only need enough candles to cover ~30h back (for the 24h change/
+        // volume calcs below), not the full 1000-candle history — cuts
+        // payload size a lot when there are hundreds of pairs to load.
+        const limit = Math.min(1000, Math.max(50, Math.ceil((30 * 3_600_000) / intervalToMs(interval))));
+        const res = await fetch(`${API_BASE}/csv-candles/${symbol}?interval=${interval}&limit=${limit}`);
+        if (!res.ok) { pairCandles.set(key, []); return; }
+        const rawCandles = await res.json();
+        pairCandles.set(key, rawCandles.map(r => ({
+          openTimeMs: r[0], open: parseFloat(r[1]), high: parseFloat(r[2]),
+          low: parseFloat(r[3]), close: parseFloat(r[4]), volume: parseFloat(r[5]),
+        })));
+      }, CSV_CANDLE_CONCURRENCY);
+
+      if (csvFetchIdRef.current !== requestId) return;
+
+      const findAtOrBefore = (candles, targetMs) => {
+        for (let i = candles.length - 1; i >= 0; i--) {
+          if (candles[i].openTimeMs <= targetMs) return candles[i];
+        }
+        return null;
+      };
+
+      const rows = rawSignals.map(s => {
+        const candles = pairCandles.get(`${s.symbol}|${s.interval}`) || [];
+        const latest = candles[candles.length - 1] || null;
+        const c1h = findAtOrBefore(candles, nowMs - 3_600_000);
+        const c24h = findAtOrBefore(candles, nowMs - 86_400_000);
+        const change_1h = (latest && c1h && c1h.close) ? ((latest.close - c1h.close) / c1h.close) * 100 : 0;
+        const change_24h = (latest && c24h && c24h.close) ? ((latest.close - c24h.close) / c24h.close) * 100 : 0;
+        const volume_24h = candles.filter(c => c.openTimeMs >= nowMs - 86_400_000).reduce((sum, c) => sum + c.volume, 0);
+
+        const ema_trend = (s.ema_fast != null && s.ema_mid != null && s.ema_slow != null)
+          ? (s.ema_fast > s.ema_mid && s.ema_mid > s.ema_slow ? "Bullish"
+             : s.ema_fast < s.ema_mid && s.ema_mid < s.ema_slow ? "Bearish" : "Neutral")
+          : "Neutral";
+
+        return {
+          symbol: s.symbol, interval: s.interval, ema_trend,
+          score: s.score, price: s.cross_price,
+          change_1h, change_24h, volume_24h,
+          last_signal: s.signal_type, signal_time: s.cross_time, cross_price: s.cross_price,
+          ema_7: s.ema_fast, ema_25: s.ema_mid, ema_99: s.ema_slow,
+          _isCsv: true,
+        };
+      });
+
+      setCsvRows(rows);
+    } catch (e) {
+      if (csvFetchIdRef.current === requestId) {
+        setCsvRows([]);
+        setCsvError(e.message);
+      }
+    } finally {
+      if (csvFetchIdRef.current === requestId) setCsvLoading(false);
+    }
+  }, []);
+
+  // Hydrate from whatever was already imported, so a page reload still shows
+  // the last uploaded CSV's coins instead of an empty page.
+  useEffect(() => { loadCsvRows(); }, [loadCsvRows]);
+
+  // Direct inline upload — no navigation to a separate page. The file picker
+  // fires as soon as a file is chosen; results render right on this page.
+  const handleCsvFileSelected = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file again later
+    if (!file) return;
+    setCsvUploading(true);
+    setCsvUploadError(null);
+    setCsvSummary(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch(`${API_BASE}/csv-import`, { method: "POST", body: formData });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail || `API ${res.status}`);
+      }
+      const summary = await res.json();
+      setCsvSummary(summary);
+      if (summary.signals_imported > 0) loadCsvRows();
+    } catch (err) {
+      setCsvUploadError(err.message);
+    } finally {
+      setCsvUploading(false);
+    }
+  };
+
+  const csvToggleSort = k => setCsvSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"desc"});
+  // Scanner page now stays mounted in the background (see App()) so its data
+  // survives navigating to Backtest and back — without useMemo here, these
+  // would re-filter/re-sort thousands of rows on every unrelated render
+  // elsewhere in the app (e.g. any click that changes App's `page` state),
+  // even while this page is hidden, causing exactly that kind of lag.
+  const csvFilteredRows = useMemo(() => csvRows.filter(r => {
+    if (csvTrendFilter !== "All" && r.ema_trend !== csvTrendFilter) return false;
+    if (csvSigFilter !== "All" && r.last_signal !== csvSigFilter) return false;
+    if (csvSearch && !r.symbol.toLowerCase().includes(csvSearch.toLowerCase())) return false;
+    return true;
+  }), [csvRows, csvTrendFilter, csvSigFilter, csvSearch]);
+  const csvSortedRows = useMemo(() => [...csvFilteredRows].sort((a, b) => {
+    const dir = csvSort.dir === "asc" ? 1 : -1;
+    const av = a[csvSort.k], bv = b[csvSort.k];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1; if (bv == null) return -1;
+    return typeof av === "string" ? dir*av.localeCompare(bv) : dir*(av-bv);
+  }), [csvFilteredRows, csvSort]);
+
+  const csvPageCount = Math.max(1, Math.ceil(csvSortedRows.length / CSV_PAGE_SIZE));
+  // Filters/search/sort changing the result set can leave `csvPage` pointing
+  // past the new last page (e.g. was on page 5, a filter now only has 2) —
+  // clamp instead of rendering an empty page.
   useEffect(() => {
-    setLoading(true);
-    fetchData();
-    intRef.current = setInterval(fetchData, 30000);
-    return () => clearInterval(intRef.current);
-  }, [fetchData]);
+    if (csvPage > csvPageCount) setCsvPage(csvPageCount);
+  }, [csvPage, csvPageCount]);
+  useEffect(() => { setCsvPage(1); }, [csvTrendFilter, csvSigFilter, csvSearch, csvSort]);
+  const csvPageRows = useMemo(() => {
+    const start = (csvPage - 1) * CSV_PAGE_SIZE;
+    return csvSortedRows.slice(start, start + CSV_PAGE_SIZE);
+  }, [csvSortedRows, csvPage]);
 
-  const filtered = rows
-    .filter(r => {
-      if (trend !== "All" && r.ema_trend !== trend) return false;
-      if (search && !r.symbol.toLowerCase().includes(search.toLowerCase())) return false;
-      return true;
-    })
-    .sort((a, b) => {
-      const dir = sort.dir === "asc" ? 1 : -1;
-      const av = a[sort.k], bv = b[sort.k];
-      if (av == null && bv == null) return 0;
-      if (av == null) return 1; if (bv == null) return -1;
-      return typeof av === "string" ? dir*av.localeCompare(bv) : dir*(av-bv);
-    });
-
-  const toggleSort = k => setSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"desc"});
-
-  const bullishCount = rows.filter(r => r.ema_trend === "Bullish").length;
-  const bearishCount = rows.filter(r => r.ema_trend === "Bearish").length;
-  const scoredRows = rows.filter(r => r.last_signal);
-  const avgScore = scoredRows.length
-    ? Math.round(scoredRows.reduce((s, r) => s + (r.score || 0), 0) / scoredRows.length)
-    : 0;
+  const csvStats = useMemo(() => {
+    const bullish = csvRows.filter(r => r.ema_trend === "Bullish").length;
+    const bearish = csvRows.filter(r => r.ema_trend === "Bearish").length;
+    const scored  = csvRows.filter(r => r.last_signal);
+    const avgScore = scored.length
+      ? Math.round(scored.reduce((s, r) => s + (r.score || 0), 0) / scored.length)
+      : 0;
+    const distinctSymbols = new Set(csvRows.map(r => r.symbol)).size;
+    return { bullish, bearish, avgScore, distinctSymbols };
+  }, [csvRows]);
+  const { bullish: csvBullishCount, bearish: csvBearishCount, avgScore: csvAvgScore, distinctSymbols: csvDistinctSymbols } = csvStats;
 
   return (
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
@@ -475,168 +604,226 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest, onScreenerBackt
         <div>
           <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>EMA SCANNER</div>
           <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
-            TRIPLE EMA STRATEGY 7 › 25 › 99 · {market === "spot" ? "Spot" : "USDT Futures"}
+            TRIPLE EMA STRATEGY 7 › 25 › 99
           </div>
         </div>
-        <div style={{ display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
-          <MarketToggle market={market} setMarket={setMarket} />
-          {status && (
-            <span style={{ display:"flex", alignItems:"center", gap:6, fontSize:12, color:"#6b7280", fontWeight:500 }}>
-              <span style={{ width:7, height:7, borderRadius:"50%", background:status.status==="ready"?"#22c55e":"#f59e0b", display:"inline-block" }}/>
-              {status.status === "ready"
-                ? (scannedAgoSec != null ? `Scanned ${scannedAgoSec}s ago` : "Live")
-                : "Initializing"}
-            </span>
-          )}
-          <button onClick={fetchData} title="Refresh" style={{
-            width:32, height:32, borderRadius:8, border:"1px solid #e5e7eb", background:"#fff",
-            fontSize:15, color:"#374151", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center",
-          }}>↻</button>
-        </div>
-      </div>
-
-      {/* Summary cards */}
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:16, padding:"0 24px 16px" }}>
-        <SummaryCard
-          label="Bullish" badge="7›25›99" badgeBg="#bbf1d3" badgeColor="#166534"
-          value={bullishCount} valueColor="#16a34a" bg="#e7f8ef" Icon={TrendingUp}
-        />
-        <SummaryCard
-          label="Bearish" badge="99›25›7" badgeBg="#fbcfd1" badgeColor="#991b1b"
-          value={bearishCount} valueColor="#dc2626" bg="#fdecec" Icon={TrendingDown}
-        />
-        <SummaryCard
-          label="Avg Score" badge="AVG" badgeBg="#111827" badgeColor="#fff"
-          value={avgScore} valueColor="#111827" bg="#e7e7fb" Icon={Target}
-        />
-        <SummaryCard
-          label="Stored" badge="TOTAL" badgeBg="#fcd9a8" badgeColor="#9a5b13"
-          value={status?.symbols_tracked ?? rows.length} valueColor="#f59e0b" bg="#fdf1e2" Icon={Database}
-        />
-      </div>
-
-      {/* Search */}
-      <div style={{ padding:"0 24px 12px" }}>
-        <div style={{ position:"relative", maxWidth:260 }}>
-          <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", color:"#9ca3af", fontSize:13 }}>⌕</span>
-          <input placeholder="Search coins…" value={search} onChange={e=>setSearch(e.target.value)} style={{
-            width:"100%", padding:"9px 14px 9px 32px", borderRadius:10, border:"1px solid #e5e7eb", fontSize:13,
-            color:"#374151", outline:"none", background:"#fff", boxSizing:"border-box",
-          }}/>
-        </div>
-        <div style={{ marginTop:8, fontSize:12, color:"#9ca3af" }}>
-          <strong style={{ color:"#374151" }}>{filtered.length}</strong> entries
-          {status && <> · Signals today: <strong style={{ color:"#374151" }}>{status.signals_today}</strong> · Uptime: <strong style={{ color:"#374151" }}>{Math.floor(status.uptime_seconds/60)}m</strong></>}
-        </div>
-      </div>
-
-      {/* Filters */}
-      <div style={{ padding:"16px 24px", display:"flex", alignItems:"center", gap:16, flexWrap:"wrap", borderTop:"1px solid #e5e7eb", borderBottom:"1px solid #e5e7eb" }}>
-        <div style={{ display:"flex", gap:4 }}>
-          {["All","Bullish","Bearish"].map(t => (
-            <button key={t} onClick={()=>setTrend(t)} style={{
-              padding:"6px 16px", borderRadius:8, fontSize:12, fontWeight:700, cursor:"pointer",
-              border: trend===t ? "1px solid #111827" : "1px solid #e5e7eb",
-              background: trend===t ? "#111827" : "#fff",
-              color: trend===t ? "#fff" : "#6b7280", textTransform:"uppercase",
-            }}>{t}</button>
-          ))}
-        </div>
-        <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
-        <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Signal</span>
-        <div style={{ display:"flex", gap:4 }}>
-          {SIGS.map(s => (
-            <button key={s} onClick={()=>setSig(s)} style={{
-              padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
-              border:sig===s?"1.5px solid #f59e0b":"1px solid #e5e7eb", background:sig===s?"#fff7ed":"#fff",
-              color:sig===s?"#f59e0b":"#6b7280",
-            }}>{s}</button>
-          ))}
-        </div>
-        <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
-          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Sort</span>
-          {[["signal_time","Time"],["score","Score"],["volume_24h","Vol"],["change_24h","24H %"]].map(([k,l]) => (
-            <button key={k} onClick={()=>toggleSort(k)} style={{
-              padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
-              border:sort.k===k?"1.5px solid #6366f1":"1px solid #e5e7eb", background:sort.k===k?"#eef2ff":"#fff",
-              color:sort.k===k?"#6366f1":"#6b7280",
-            }}>{l}{sort.k===k ? (sort.dir==="asc"?" ↑":" ↓") : ""}</button>
-          ))}
-          <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
-          <button onClick={onScreenerBacktest} style={{
-            padding:"6px 16px", borderRadius:8, border:"1px solid #6366f1",
-            background:"transparent", color:"#6366f1", fontSize:12, fontWeight:700, cursor:"pointer",
-          }}>Backtest</button>
-        </div>
-      </div>
-
-      {/* Table */}
-      <div style={{ margin:"16px 24px 24px", background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"hidden" }}>
-      <div style={{ overflowX:"auto" }}>
-        {error ? (
-          <div style={{ padding:48, textAlign:"center", color:"#dc2626", fontSize:14 }}>
-            <div style={{ fontSize:22, marginBottom:8 }}>⚠</div>
-            Could not reach backend: <code style={{ fontSize:12 }}>{error}</code>
-            <div style={{ marginTop:6, color:"#9ca3af", fontSize:12 }}>Make sure FastAPI is running at <code>{API_BASE}</code></div>
+        {/* Once there's data, this same Upload CSV button (and Backtest
+            Summary) lives at the right end of the filter bar below instead —
+            keep it here too only for the empty-state case, where that bar
+            doesn't render at all yet. */}
+        {csvRows.length === 0 && (
+          <div style={{ display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
+            <input type="file" accept=".csv" ref={csvInputRef} onChange={handleCsvFileSelected} style={{ display:"none" }}/>
+            <button onClick={() => csvInputRef.current?.click()} disabled={csvUploading} style={{
+              padding:"6px 16px", borderRadius:8, border:"1px solid #6366f1",
+              background:"transparent", color:"#6366f1", fontSize:12, fontWeight:700,
+              cursor: csvUploading ? "not-allowed" : "pointer", opacity: csvUploading ? 0.6 : 1,
+            }}>{csvUploading ? "Uploading…" : "Upload CSV"}</button>
+            {csvUploadError && <span style={{ color:"#dc2626", fontSize:11 }}>⚠ {csvUploadError}</span>}
           </div>
-        ) : loading ? (
-          <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:13 }}>Loading scanner data…</div>
-        ) : (
-          <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
-            <thead>
-              <tr>
-                {SCOLS.map(col => (
-                  <TH key={col.k} right={col.r} onClick={col.s?()=>toggleSort(col.k):null}
-                    sorted={sort.k===col.k} dir={sort.dir}>{col.l}</TH>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.length === 0 ? (
-                <tr><td colSpan={11} style={{ padding:48, textAlign:"center", color:"#9ca3af", fontSize:13 }}>No coins match your filters.</td></tr>
-              ) : filtered.map((row, i) => {
-                const { base, quote } = fmtSym(row.symbol);
-                return (
-                  <tr key={row.symbol}
-                    style={{ borderBottom:"1px solid #f3f4f6", background:i%2===0?"#fff":"#fafafa", transition:"background 0.1s" }}
-                    onMouseEnter={e=>e.currentTarget.style.background="#f0f9ff"}
-                    onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"#fff":"#fafafa"}
-                  >
-                    <td style={{ padding:"11px 14px", color:"#9ca3af", fontWeight:500 }}>{i + 1}</td>
-                    <td style={{ padding:"11px 14px", fontWeight:700, cursor:"pointer" }} onClick={()=>setModal(row)}>
-                      <span style={{ color:"#f59e0b" }}>{base}</span>
-                      <span style={{ color:"#9ca3af", fontSize:11 }}>{quote}</span>
-                    </td>
-                    <td style={{ padding:"11px 14px" }}><Trend t={row.ema_trend}/></td>
-                    <td style={{ padding:"11px 14px", textAlign:"right" }}><ScoreBadge v={row.score}/></td>
-                    <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:500 }}>{fmtPrice(row.price)}</td>
-                    <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}><ChgCell v={row.change_1h}/></td>
-                    <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}><ChgCell v={row.change_24h}/></td>
-                    <td style={{ padding:"11px 14px", textAlign:"right", color:"#374151", fontVariantNumeric:"tabular-nums" }}>{fmtVol(row.volume_24h)}</td>
-                    <td style={{ padding:"11px 14px" }}><SigBadge s={row.last_signal}/></td>
-                    <td style={{ padding:"11px 14px", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{row.signal_time ? fmtTime(row.signal_time) : "—"}</td>
-                    <td style={{ padding:"11px 14px" }}>
-                      <button
-                        onClick={() => onDetails(row)}
-                        style={{
-                          padding:"4px 12px", borderRadius:6, border:"1px solid #6366f1",
-                          background:"transparent", color:"#6366f1", fontSize:11, fontWeight:600,
-                          cursor:"pointer", whiteSpace:"nowrap", transition:"all 0.15s",
-                        }}
-                        onMouseEnter={e=>{e.target.style.background="#6366f1";e.target.style.color="#fff";}}
-                        onMouseLeave={e=>{e.target.style.background="transparent";e.target.style.color="#6366f1";}}
-                      >
-                        Details
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
         )}
       </div>
-      </div>
+
+      {/* Upload feedback */}
+      {csvSummary && (
+        <div style={{ margin:"0 24px 16px", background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", padding:"16px 20px" }}>
+          <div style={{ fontSize:12, color:"#374151" }}>
+            Fetched candle history for <strong>{csvSummary.symbols_fetched}</strong> coin(s), imported{" "}
+            <strong>{csvSummary.signals_imported}</strong> signal(s).
+          </div>
+          {csvSummary.errors?.length > 0 && (
+            <div style={{ marginTop:6, color:"#dc2626", fontSize:12 }}>
+              {csvSummary.errors.length} coin(s) failed to fetch:
+              <ul style={{ margin:"4px 0 0 18px" }}>
+                {csvSummary.errors.slice(0, 10).map((e, i) => <li key={i}>{e}</li>)}
+              </ul>
+            </div>
+          )}
+          {csvSummary.warnings?.length > 0 && (
+            <div style={{ marginTop:6, color:"#9a5b13", fontSize:12 }}>
+              {csvSummary.warnings.length} row(s) skipped:
+              <ul style={{ margin:"4px 0 0 18px" }}>
+                {csvSummary.warnings.slice(0, 10).map((w, i) => <li key={i}>{w}</li>)}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {csvLoading && csvRows.length === 0 ? (
+        <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:13 }}>Loading CSV data…</div>
+      ) : csvError ? (
+        <div style={{ margin:"0 24px 16px", padding:24, textAlign:"center", color:"#dc2626", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>⚠ {csvError}</div>
+      ) : csvRows.length === 0 ? (
+        <div style={{ margin:"0 24px 16px", padding:60, textAlign:"center", color:"#9ca3af", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
+          No CSV data yet — click "Upload CSV" to import your signals.
+        </div>
+      ) : (
+        <>
+          {/* Summary cards */}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:16, padding:"0 24px 16px" }}>
+            <SummaryCard
+              label="Bullish" badge="7›25›99" badgeBg="#bbf1d3" badgeColor="#166534"
+              value={csvBullishCount} valueColor="#16a34a" bg="#e7f8ef" Icon={TrendingUp}
+            />
+            <SummaryCard
+              label="Bearish" badge="99›25›7" badgeBg="#fbcfd1" badgeColor="#991b1b"
+              value={csvBearishCount} valueColor="#dc2626" bg="#fdecec" Icon={TrendingDown}
+            />
+            <SummaryCard
+              label="Avg Score" badge="AVG" badgeBg="#111827" badgeColor="#fff"
+              value={csvAvgScore} valueColor="#111827" bg="#e7e7fb" Icon={Target}
+            />
+            <SummaryCard
+              label="Stored" badge="TOTAL" badgeBg="#fcd9a8" badgeColor="#9a5b13"
+              value={csvDistinctSymbols} valueColor="#f59e0b" bg="#fdf1e2" Icon={Database}
+            />
+          </div>
+
+          {/* Search */}
+          <div style={{ padding:"0 24px 12px" }}>
+            <div style={{ position:"relative", maxWidth:260 }}>
+              <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", color:"#9ca3af", fontSize:13 }}>⌕</span>
+              <input placeholder="Search coins…" value={csvSearch} onChange={e=>setCsvSearch(e.target.value)} style={{
+                width:"100%", padding:"9px 14px 9px 32px", borderRadius:10, border:"1px solid #e5e7eb", fontSize:13,
+                color:"#374151", outline:"none", background:"#fff", boxSizing:"border-box",
+              }}/>
+            </div>
+            <div style={{ marginTop:8, fontSize:12, color:"#9ca3af" }}>
+              <strong style={{ color:"#374151" }}>{csvSortedRows.length}</strong> entries
+            </div>
+          </div>
+
+          {/* Filters */}
+          <div style={{ padding:"16px 24px", display:"flex", alignItems:"center", gap:16, flexWrap:"wrap", borderTop:"1px solid #e5e7eb", borderBottom:"1px solid #e5e7eb" }}>
+            <div style={{ display:"flex", gap:4 }}>
+              {["All","Bullish","Bearish"].map(t => (
+                <button key={t} onClick={()=>setCsvTrendFilter(t)} style={{
+                  padding:"6px 16px", borderRadius:8, fontSize:12, fontWeight:700, cursor:"pointer",
+                  border: csvTrendFilter===t ? "1px solid #111827" : "1px solid #e5e7eb",
+                  background: csvTrendFilter===t ? "#111827" : "#fff",
+                  color: csvTrendFilter===t ? "#fff" : "#6b7280", textTransform:"uppercase",
+                }}>{t}</button>
+              ))}
+            </div>
+            <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+            <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Signal</span>
+            <div style={{ display:"flex", gap:4 }}>
+              {SIGS.map(s => (
+                <button key={s} onClick={()=>setCsvSigFilter(s)} style={{
+                  padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
+                  border:csvSigFilter===s?"1.5px solid #f59e0b":"1px solid #e5e7eb", background:csvSigFilter===s?"#fff7ed":"#fff",
+                  color:csvSigFilter===s?"#f59e0b":"#6b7280",
+                }}>{s}</button>
+              ))}
+            </div>
+            <div style={{ marginLeft:"auto", display:"flex", alignItems:"center", gap:8, flexWrap:"wrap" }}>
+              <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Sort</span>
+              {[["signal_time","Time"],["score","Score"],["volume_24h","Vol"],["change_24h","24H %"]].map(([k,l]) => (
+                <button key={k} onClick={()=>csvToggleSort(k)} style={{
+                  padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
+                  border:csvSort.k===k?"1.5px solid #6366f1":"1px solid #e5e7eb", background:csvSort.k===k?"#eef2ff":"#fff",
+                  color:csvSort.k===k?"#6366f1":"#6b7280",
+                }}>{l}{csvSort.k===k ? (csvSort.dir==="asc"?" ↑":" ↓") : ""}</button>
+              ))}
+              <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+              <button onClick={onScreenerBacktest} style={{
+                padding:"6px 16px", borderRadius:8, border:"1px solid #6366f1",
+                background:"transparent", color:"#6366f1", fontSize:12, fontWeight:700, cursor:"pointer", whiteSpace:"nowrap",
+              }}>Backtest Summary</button>
+              <input type="file" accept=".csv" ref={csvInputRef} onChange={handleCsvFileSelected} style={{ display:"none" }}/>
+              <button onClick={() => csvInputRef.current?.click()} disabled={csvUploading} style={{
+                padding:"6px 16px", borderRadius:8, border:"1px solid #6366f1",
+                background:"transparent", color:"#6366f1", fontSize:12, fontWeight:700, whiteSpace:"nowrap",
+                cursor: csvUploading ? "not-allowed" : "pointer", opacity: csvUploading ? 0.6 : 1,
+              }}>{csvUploading ? "Uploading…" : "Upload CSV"}</button>
+              {csvUploadError && <span style={{ color:"#dc2626", fontSize:11 }}>⚠ {csvUploadError}</span>}
+            </div>
+          </div>
+
+          {/* Table */}
+          <div style={{ margin:"16px 24px 24px", background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"hidden" }}>
+          <div style={{ overflowX:"auto" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+              <thead>
+                <tr>
+                  {SCOLS.map(col => (
+                    <TH key={col.k} right={col.r} onClick={col.s?()=>csvToggleSort(col.k):null}
+                      sorted={csvSort.k===col.k} dir={csvSort.dir}>{col.l}</TH>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {csvSortedRows.length === 0 ? (
+                  <tr><td colSpan={11} style={{ padding:48, textAlign:"center", color:"#9ca3af", fontSize:13 }}>No coins match your filters.</td></tr>
+                ) : csvPageRows.map((row, iOnPage) => {
+                  const i = (csvPage - 1) * CSV_PAGE_SIZE + iOnPage;
+                  const { base, quote } = fmtSym(row.symbol);
+                  return (
+                    <tr key={`${row.symbol}-${row.interval}-${i}`}
+                      style={{ borderBottom:"1px solid #f3f4f6", background:i%2===0?"#fff":"#fafafa", transition:"background 0.1s" }}
+                      onMouseEnter={e=>e.currentTarget.style.background="#f0f9ff"}
+                      onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"#fff":"#fafafa"}
+                    >
+                      <td style={{ padding:"11px 14px", color:"#9ca3af", fontWeight:500 }}>{i + 1}</td>
+                      <td style={{ padding:"11px 14px", fontWeight:700, cursor:"pointer" }} onClick={()=>setModal(row)}>
+                        <span style={{ color:"#f59e0b" }}>{base}</span>
+                        <span style={{ color:"#9ca3af", fontSize:11 }}>{quote}</span>
+                      </td>
+                      <td style={{ padding:"11px 14px" }}><Trend t={row.ema_trend}/></td>
+                      <td style={{ padding:"11px 14px", textAlign:"right" }}><ScoreBadge v={row.score}/></td>
+                      <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:500 }}>{fmtPrice(row.price)}</td>
+                      <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}><ChgCell v={row.change_1h}/></td>
+                      <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}><ChgCell v={row.change_24h}/></td>
+                      <td style={{ padding:"11px 14px", textAlign:"right", color:"#374151", fontVariantNumeric:"tabular-nums" }}>{fmtVol(row.volume_24h)}</td>
+                      <td style={{ padding:"11px 14px" }}><SigBadge s={row.last_signal}/></td>
+                      <td style={{ padding:"11px 14px", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>
+                        {row.signal_time ? fmtTime(row.signal_time) : "—"}
+                        <span style={{ marginLeft:6, fontSize:10, color:"#9ca3af", border:"1px solid #e5e7eb", borderRadius:4, padding:"1px 5px" }}>{row.interval}</span>
+                      </td>
+                      <td style={{ padding:"11px 14px" }}>
+                        <button
+                          onClick={() => setModal(row)}
+                          style={{
+                            padding:"4px 12px", borderRadius:6, border:"1px solid #6366f1",
+                            background:"transparent", color:"#6366f1", fontSize:11, fontWeight:600,
+                            cursor:"pointer", whiteSpace:"nowrap", transition:"all 0.15s",
+                          }}
+                          onMouseEnter={e=>{e.target.style.background="#6366f1";e.target.style.color="#fff";}}
+                          onMouseLeave={e=>{e.target.style.background="transparent";e.target.style.color="#6366f1";}}
+                        >
+                          Details
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          {csvSortedRows.length > 0 && (
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 16px", borderTop:"1px solid #e5e7eb" }}>
+              <span style={{ fontSize:12, color:"#9ca3af" }}>
+                Showing {(csvPage-1)*CSV_PAGE_SIZE+1}–{Math.min(csvPage*CSV_PAGE_SIZE, csvSortedRows.length)} of {csvSortedRows.length}
+              </span>
+              <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                <button onClick={()=>setCsvPage(p=>Math.max(1,p-1))} disabled={csvPage<=1} style={{
+                  padding:"6px 14px", borderRadius:7, fontSize:12, fontWeight:600,
+                  border:"1px solid #e5e7eb", background:"#fff", color:csvPage<=1?"#d1d5db":"#374151",
+                  cursor:csvPage<=1?"default":"pointer",
+                }}>Prev</button>
+                <span style={{ fontSize:12, color:"#6b7280" }}>Page {csvPage} of {csvPageCount}</span>
+                <button onClick={()=>setCsvPage(p=>Math.min(csvPageCount,p+1))} disabled={csvPage>=csvPageCount} style={{
+                  padding:"6px 14px", borderRadius:7, fontSize:12, fontWeight:600,
+                  border:"1px solid #e5e7eb", background:"#fff", color:csvPage>=csvPageCount?"#d1d5db":"#374151",
+                  cursor:csvPage>=csvPageCount?"default":"pointer",
+                }}>Next</button>
+              </div>
+            </div>
+          )}
+          </div>
+        </>
+      )}
 
       {/* Detail modal */}
       {modal && (
@@ -694,21 +881,31 @@ function ScannerPage({ market, setMarket, onDetails, onBacktest, onScreenerBackt
     </div>
   );
 }
+// Wrapped in memo() because App() now keeps this component permanently
+// mounted (just hidden) so its data survives navigating away and back —
+// without memo, every click anywhere in the app (any `page` state change)
+// would still re-run this whole function, including re-mapping thousands of
+// CSV rows into table JSX, even while completely invisible.
+const ScannerPage = memo(ScannerPageImpl);
 
 // ─── Screener Backtest Page (aggregate Day/Week/Month WIN/LOSS/OPEN) ─────────
 const BT_PERIOD_LABELS = [["day","Day"],["week","Week"],["month","Month"]];
 
-function ScreenerBacktestPage({ market, onBack }) {
+function ScreenerBacktestPage({ onBack }) {
   const [btPeriod, setBtPeriod] = useState("day");
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd] = useState("");
   const [btRrMode, setBtRrMode] = useState("1:2");
   const [btCapital, setBtCapital] = useState(1000);
-  const [btStats, setBtStats] = useState(null);
   const [btLoading, setBtLoading] = useState(true);
   const [btError, setBtError] = useState(null);
   const [trades, setTrades] = useState([]);
-  const [sort, setSort] = useState({ k:"_entryTimeMs", dir:"desc" });
+  const [btTimeframeFilter, setBtTimeframeFilter] = useState("All");
+  const [sort, setSort] = useState({ k:"_signalTimeMs", dir:"desc" });
   const [exporting, setExporting] = useState(false);
   const fetchIdRef = useRef(0);
+  const customStartRef = useRef(null);
+  const customEndRef = useRef(null);
 
   // Aggregate Day/Week/Month backtest — how many of ALL 1H signals in this
   // window resolved as WIN/LOSS, or are still OPEN. Reuses the same
@@ -721,77 +918,149 @@ function ScreenerBacktestPage({ market, onBack }) {
     // a slower older request must not be allowed to clobber the newer one's
     // state once it resolves.
     const requestId = ++fetchIdRef.current;
-    setBtLoading(true);
+
+    // Wait for BOTH From and To before reloading — picking just one used to
+    // silently fall back to whatever Day/Week/Month preset was last
+    // selected (isCustom below requires both), reloading with a range the
+    // user hadn't actually finished choosing yet.
+    if (Boolean(customStart) !== Boolean(customEnd)) {
+      setBtLoading(false);
+      return;
+    }
+
     setBtError(null);
+    setBtTimeframeFilter("All"); // last period's selected timeframe may not exist in the new result set
+
+    // Picking both a from/to date always takes priority over the Day/Week/
+    // Month buttons — no separate "Custom" mode to switch into first.
+    const isCustom = !!(customStart && customEnd);
+    // "Day" means the actual calendar day (IST midnight to now) — same
+    // boundary the backend's "Signals today" count uses — not a rolling
+    // last-24-hours window, which would spill into yesterday evening.
+    const isCalendarDay = btPeriod === "day" && !isCustom;
+
+    setBtLoading(true);
     try {
-      const days = BT_PERIOD_DAYS[btPeriod];
-      // Only fetch as many candles as this window actually needs (plus a
-      // buffer for the SL/TP walk-forward after entry) instead of always
-      // pulling the full 1500-candle history — cuts payload size a lot for
-      // Day/Week, and meaningfully for Month too.
-      const candleLimit = Math.min(1500, days * 24 + 200);
-      const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=10000`);
+      // /api/csv-signals returns everything with no day/range filter, so the
+      // window is always narrowed down to [rangeStartMs, rangeEndMs] here —
+      // unlike the old scanner endpoint, there's no server-side "last N days"
+      // shortcut to lean on.
+      let rangeStartMs, rangeEndMs;
+      if (isCustom) {
+        rangeStartMs = new Date(`${customStart}T00:00:00`).getTime();
+        rangeEndMs   = new Date(`${customEnd}T23:59:59.999`).getTime();
+      } else if (isCalendarDay) {
+        const IST_OFFSET_MS = 5.5 * 3_600_000;
+        const nowIst = Date.now() + IST_OFFSET_MS;
+        const todayIstMidnightIst = Math.floor(nowIst / 86_400_000) * 86_400_000;
+        rangeStartMs = todayIstMidnightIst - IST_OFFSET_MS; // back to real UTC ms
+        rangeEndMs   = Date.now();
+      } else {
+        rangeStartMs = Date.now() - BT_PERIOD_DAYS[btPeriod] * 86_400_000;
+        rangeEndMs   = Date.now();
+      }
+
+      const sigRes = await fetch(`${API_BASE}/csv-signals`);
       if (!sigRes.ok) throw new Error(`API ${sigRes.status}`);
       const rawSignals = await sigRes.json();
 
-      // The backend occasionally stores the same crossover twice (near-identical
-      // cross_time a few hundred ms apart, from separate scan runs) — collapse
-      // those down to one signal per symbol/type/minute before simulating, same
-      // as the Details/Backtest pages already do.
-      const bySymbol = new Map();
+      // A CSV can carry several timeframes per coin (5m/15m/1h/...), each
+      // needing its own candle fetch and its own candle-duration for
+      // dedupe/simulation — group by (symbol, interval) instead of just
+      // symbol, same pattern as ScannerPage.loadCsvRows. The backend can
+      // also end up with more than one stored row for what's really the
+      // same crossover, so collapse by which candle it maps to, same as
+      // before, just using each pair's own interval instead of a fixed 1H.
+      const byPair = new Map();
       const seenKeys = new Set();
       for (const s of rawSignals) {
         const crossTimeMs = new Date(s.cross_time).getTime();
-        const dedupeKey = `${s.symbol}|${s.signal_type}|${Math.round(crossTimeMs / 60000)}`;
+        if (crossTimeMs < rangeStartMs || crossTimeMs > rangeEndMs) continue;
+        const candleMs = intervalToMs(s.interval);
+        const dedupeKey = `${s.symbol}|${s.interval}|${s.signal_type}|${Math.floor(crossTimeMs / candleMs)}`;
         if (seenKeys.has(dedupeKey)) continue;
         seenKeys.add(dedupeKey);
-        if (!bySymbol.has(s.symbol)) bySymbol.set(s.symbol, []);
-        bySymbol.get(s.symbol).push({
-          type: s.signal_type, crossPrice: s.cross_price, crossTimeMs,
-        });
+        const pairKey = `${s.symbol}|${s.interval}`;
+        if (!byPair.has(pairKey)) byPair.set(pairKey, []);
+        byPair.get(pairKey).push({ type: s.signal_type, crossPrice: s.cross_price, crossTimeMs });
       }
 
-      const perSymbol = await Promise.all([...bySymbol.entries()].map(async ([symbol, sigs]) => {
-        const res = await fetch(`${API_BASE}/candles/${symbol}?interval=1h&market=${market}&limit=${candleLimit}`);
+      // The selected Period can span well beyond what 1000 candles covers
+      // for a short timeframe (1000 5m candles ≈ 3.5 days) — same fix as the
+      // per-coin Backtest Details page's ensure-depth call, just applied
+      // per pair here since this view mixes every coin/timeframe at once.
+      // A wide Month/custom range can mean hundreds of pairs genuinely need
+      // fresh Binance history at once — firing all of those concurrently
+      // (unbounded Promise.all) floods Binance from many separate ccxt
+      // clients that can't see each other's rate limiting, which gets them
+      // throttled and stuck retrying with multi-second backoffs. Bounding
+      // concurrency here (same helper/limit ScannerPage's CSV load uses)
+      // keeps total in-flight requests reasonable so it actually finishes.
+      const periodDays = Math.ceil((rangeEndMs - rangeStartMs) / 86_400_000);
+      const perPair = await runWithConcurrency([...byPair.entries()], async ([pairKey, sigs]) => {
+        const [symbol, interval] = pairKey.split("|");
+        const neededCandles = Math.ceil((periodDays * 86_400_000) / intervalToMs(interval)) + 50;
+        if (neededCandles > 1000) {
+          try {
+            await fetch(`${API_BASE}/csv-candles/${symbol}/ensure-depth?interval=${interval}&days=${periodDays}`, { method: "POST" });
+          } catch {
+            // Non-fatal — fall through and use whatever history is already stored.
+          }
+        }
+        const candleLimit = Math.min(20_000, Math.max(1000, neededCandles));
+        const res = await fetch(`${API_BASE}/csv-candles/${symbol}?interval=${interval}&limit=${candleLimit}`);
         if (!res.ok) return [];
         const rawCandles = await res.json();
         const candles = rawCandles.map(r => ({
           symbol, openTimeMs: r[0],
           open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]),
         }));
-        // runBacktestFromSignals requires oldest->newest — the API returns
-        // signals newest-first, so this must be sorted before simulating
-        // (every other caller of this function already does this).
+        // runBacktestFromSignals requires oldest->newest.
         const sortedSigs = [...sigs].sort((a, b) => a.crossTimeMs - b.crossTimeMs);
-        return runBacktestFromSignals(candles, sortedSigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h", btCapital);
-      }));
+        return runBacktestFromSignals(candles, sortedSigs, btRrMode, 3650, intervalToMs(interval), interval, btCapital);
+      }, CSV_CANDLE_CONCURRENCY);
 
       if (fetchIdRef.current !== requestId) return; // a newer request has since superseded this one
 
-      const allTrades = perSymbol.flat();
-      const won    = allTrades.filter(t => t.result === "WIN").length;
-      const lost   = allTrades.filter(t => t.result === "LOSS").length;
-      const closed = allTrades.filter(t => t.result === "WIN" || t.result === "LOSS");
-      const pnl    = closed.reduce((sum, t) => sum + t.gainPct, 0);
-      const pnlDollar = closed.reduce((sum, t) => sum + t.gainDollar, 0);
-      const winRate = closed.length > 0 ? (won / closed.length) * 100 : null;
-      setBtStats({ won, lost, pnl, pnlDollar, winRate, total: allTrades.length });
-      setTrades(allTrades);
+      setTrades(perPair.flat());
     } catch (e) {
       if (fetchIdRef.current === requestId) {
-        setBtStats(null);
         setTrades([]);
         setBtError(e.message);
       }
     } finally {
       if (fetchIdRef.current === requestId) setBtLoading(false);
     }
-  }, [btPeriod, btRrMode, btCapital, market]);
+  }, [btPeriod, customStart, customEnd, btRrMode, btCapital]);
 
   useEffect(() => { fetchBacktestStats(); }, [fetchBacktestStats]);
 
+  // Distinct timeframes present in the current result set, ordered by actual
+  // duration (5m before 1h before 1d) rather than alphabetically.
+  const availableTimeframes = useMemo(() => {
+    const seen = [...new Set(trades.map(t => t.timeFrame))];
+    seen.sort((a, b) => intervalToMs(a.toLowerCase()) - intervalToMs(b.toLowerCase()));
+    return seen;
+  }, [trades]);
+
+  const filteredTrades = useMemo(() => (
+    btTimeframeFilter === "All" ? trades : trades.filter(t => t.timeFrame === btTimeframeFilter)
+  ), [trades, btTimeframeFilter]);
+
+  // Stat cards (Won/Loss/PnL/Win rate) recompute from whichever timeframe is
+  // selected, instead of always reflecting the full unfiltered result set.
+  const btStats = useMemo(() => {
+    const won    = filteredTrades.filter(t => t.result === "WIN").length;
+    const lost   = filteredTrades.filter(t => t.result === "LOSS").length;
+    const closed = filteredTrades.filter(t => t.result === "WIN" || t.result === "LOSS");
+    const pnl    = closed.reduce((sum, t) => sum + t.gainPct, 0);
+    const pnlDollar = closed.reduce((sum, t) => sum + t.gainDollar, 0);
+    const winRate = closed.length > 0 ? (won / closed.length) * 100 : null;
+    return { won, lost, pnl, pnlDollar, winRate, total: filteredTrades.length };
+  }, [filteredTrades]);
+
   const toggleSort = k => setSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"desc"});
-  const sortedTrades = [...trades].sort((a, b) => {
+  const sortedTrades = [...filteredTrades].sort((a, b) => {
     const dir = sort.dir === "asc" ? 1 : -1;
     const av = a[sort.k], bv = b[sort.k];
     if (av == null && bv == null) return 0;
@@ -807,30 +1076,57 @@ function ScreenerBacktestPage({ market, onBack }) {
     setExporting(true);
     try {
       const allRows = [];
-      for (const period of ["day", "week", "month"]) {
-        const days = BT_PERIOD_DAYS[period];
-        const candleLimit = Math.min(1500, days * 24 + 200);
-        const sigRes = await fetch(`${API_BASE}/signals?market=${market}&interval=1h&days=${days}&limit=10000`);
-        if (!sigRes.ok) continue;
-        const rawSignals = await sigRes.json();
+      // /csv-signals has no query params, so it's the same for every period —
+      // fetch it once and reuse for Day/Week/Month instead of refetching 3x.
+      const sigRes = await fetch(`${API_BASE}/csv-signals`);
+      if (!sigRes.ok) throw new Error(`API ${sigRes.status}`);
+      const rawSignals = await sigRes.json();
 
-        // Same near-duplicate collapse as the on-screen stats — otherwise a
-        // signal the backend stored twice would double-count in the export.
-        const bySymbol = new Map();
+      for (const period of ["day", "week", "month"]) {
+        // "day" means the actual calendar day (IST midnight to now), same as
+        // the on-screen stats — not a rolling last-24-hours window.
+        let rangeStartMs, rangeEndMs;
+        if (period === "day") {
+          const IST_OFFSET_MS = 5.5 * 3_600_000;
+          const nowIst = Date.now() + IST_OFFSET_MS;
+          const todayIstMidnightIst = Math.floor(nowIst / 86_400_000) * 86_400_000;
+          rangeStartMs = todayIstMidnightIst - IST_OFFSET_MS;
+          rangeEndMs   = Date.now();
+        } else {
+          rangeStartMs = Date.now() - BT_PERIOD_DAYS[period] * 86_400_000;
+          rangeEndMs   = Date.now();
+        }
+
+        // Same (symbol, interval) grouping + near-duplicate collapse as the
+        // on-screen stats — otherwise a signal the backend stored twice
+        // would double-count in the export.
+        const byPair = new Map();
         const seenKeys = new Set();
         for (const s of rawSignals) {
           const crossTimeMs = new Date(s.cross_time).getTime();
-          const dedupeKey = `${s.symbol}|${s.signal_type}|${Math.round(crossTimeMs / 60000)}`;
+          if (crossTimeMs < rangeStartMs || crossTimeMs > rangeEndMs) continue;
+          const candleMs = intervalToMs(s.interval);
+          const dedupeKey = `${s.symbol}|${s.interval}|${s.signal_type}|${Math.floor(crossTimeMs / candleMs)}`;
           if (seenKeys.has(dedupeKey)) continue;
           seenKeys.add(dedupeKey);
-          if (!bySymbol.has(s.symbol)) bySymbol.set(s.symbol, []);
-          bySymbol.get(s.symbol).push({
-            type: s.signal_type, crossPrice: s.cross_price, crossTimeMs,
-          });
+          const pairKey = `${s.symbol}|${s.interval}`;
+          if (!byPair.has(pairKey)) byPair.set(pairKey, []);
+          byPair.get(pairKey).push({ type: s.signal_type, crossPrice: s.cross_price, crossTimeMs });
         }
 
-        const perSymbol = await Promise.all([...bySymbol.entries()].map(async ([symbol, sigs]) => {
-          const res = await fetch(`${API_BASE}/candles/${symbol}?interval=1h&market=${market}&limit=${candleLimit}`);
+        const periodDays = Math.ceil((rangeEndMs - rangeStartMs) / 86_400_000);
+        const perPair = await runWithConcurrency([...byPair.entries()], async ([pairKey, sigs]) => {
+          const [symbol, interval] = pairKey.split("|");
+          const neededCandles = Math.ceil((periodDays * 86_400_000) / intervalToMs(interval)) + 50;
+          if (neededCandles > 1000) {
+            try {
+              await fetch(`${API_BASE}/csv-candles/${symbol}/ensure-depth?interval=${interval}&days=${periodDays}`, { method: "POST" });
+            } catch {
+              // Non-fatal — fall through and use whatever history is already stored.
+            }
+          }
+          const candleLimit = Math.min(20_000, Math.max(1000, neededCandles));
+          const res = await fetch(`${API_BASE}/csv-candles/${symbol}?interval=${interval}&limit=${candleLimit}`);
           if (!res.ok) return [];
           const rawCandles = await res.json();
           const candles = rawCandles.map(r => ({
@@ -838,14 +1134,14 @@ function ScreenerBacktestPage({ market, onBack }) {
             open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]), close: parseFloat(r[4]),
           }));
           const sortedSigs = [...sigs].sort((a, b) => a.crossTimeMs - b.crossTimeMs);
-          return runBacktestFromSignals(candles, sortedSigs, btRrMode, 3650, CANDLE_MS_MAP["1h"], "1h", btCapital);
-        }));
+          return runBacktestFromSignals(candles, sortedSigs, btRrMode, 3650, intervalToMs(interval), interval, btCapital);
+        }, CSV_CANDLE_CONCURRENCY);
 
-        for (const t of perSymbol.flat()) allRows.push({ period, ...t });
+        for (const t of perPair.flat()) allRows.push({ period, ...t });
       }
 
       const header = [
-        "Period","Symbol","Signal Type","Signal Time","Entry Time","Entry Price",
+        "Period","Symbol","Timeframe","Signal Type","Signal Time","Entry Time","Entry Price",
         "Stop Loss","Take Profit","Exit Time","Exit Price","Exit Reason",
         "Duration","PnL %","PnL Amount","PnL ($)","Result",
       ];
@@ -854,7 +1150,7 @@ function ScreenerBacktestPage({ market, onBack }) {
       for (const t of allRows) {
         const open = t.result === "OPEN";
         lines.push([
-          t.period.toUpperCase(), t.symbol, t.tradeSignal, t.signalTime || "", t.entryTime,
+          t.period.toUpperCase(), t.symbol, t.timeFrame, t.tradeSignal, t.signalTime || "", t.entryTime,
           t.entryPrice, t.stopLoss, t.targetPrice,
           open ? "Still running" : t.entryCloseTime,
           open ? "" : t.entryClose,
@@ -870,7 +1166,7 @@ function ScreenerBacktestPage({ market, onBack }) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `backtest_${market}_${btRrMode.replace(":","-")}.csv`;
+      a.download = `backtest_${btRrMode.replace(":","-")}.csv`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -880,7 +1176,7 @@ function ScreenerBacktestPage({ market, onBack }) {
     } finally {
       setExporting(false);
     }
-  }, [market, btRrMode, btCapital]);
+  }, [btRrMode, btCapital]);
 
   return (
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
@@ -893,7 +1189,7 @@ function ScreenerBacktestPage({ market, onBack }) {
         }}>← Back</button>
         <span style={{ color:"#d1d5db", fontSize:14 }}>›</span>
         <span style={{ fontWeight:800, fontSize:17 }}>Backtest Summary</span>
-        <span style={{ color:"#9ca3af", fontSize:12 }}>All coins · {market === "spot" ? "Spot" : "USDT Futures"} · 1H signals</span>
+        <span style={{ color:"#9ca3af", fontSize:12 }}>All uploaded CSV coins · mixed timeframes</span>
         <button onClick={exportAllPeriods} disabled={exporting} style={{
           marginLeft:"auto", display:"flex", alignItems:"center", gap:6,
           padding:"7px 16px", borderRadius:8, border:"none",
@@ -908,14 +1204,46 @@ function ScreenerBacktestPage({ market, onBack }) {
           <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Period</span>
           <div style={{ display:"flex", gap:4 }}>
             {BT_PERIOD_LABELS.map(([k,l]) => (
-              <button key={k} disabled={btLoading} onClick={()=>setBtPeriod(k)} style={{
+              <button key={k} disabled={btLoading} onClick={()=>{ setBtPeriod(k); setCustomStart(""); setCustomEnd(""); }} style={{
                 padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700,
-                cursor: btLoading ? "not-allowed" : "pointer", opacity: btLoading && btPeriod!==k ? 0.5 : 1,
-                border: btPeriod===k ? "1px solid #111827" : "1px solid #e5e7eb",
-                background: btPeriod===k ? "#111827" : "#fff",
-                color: btPeriod===k ? "#fff" : "#6b7280",
+                cursor: btLoading ? "not-allowed" : "pointer",
+                opacity: btLoading && (btPeriod!==k || customStart || customEnd) ? 0.5 : 1,
+                border: (btPeriod===k && !customStart && !customEnd) ? "1px solid #111827" : "1px solid #e5e7eb",
+                background: (btPeriod===k && !customStart && !customEnd) ? "#111827" : "#fff",
+                color: (btPeriod===k && !customStart && !customEnd) ? "#fff" : "#6b7280",
               }}>{l}</button>
             ))}
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+            <div style={{ position:"relative", display:"flex", alignItems:"center" }}>
+              <input
+                ref={customStartRef}
+                type="date" disabled={btLoading} value={customStart} max={customEnd || undefined}
+                onChange={e => setCustomStart(e.target.value)}
+                className="date-input-custom-icon"
+                style={{ padding:"4px 26px 4px 8px", borderRadius:6, border:"1px solid #e5e7eb", fontSize:12, color:"#374151" }}
+              />
+              <CalendarClock
+                size={14} strokeWidth={2}
+                onClick={() => customStartRef.current?.showPicker?.() ?? customStartRef.current?.focus()}
+                style={{ position:"absolute", right:7, color:"#9ca3af", cursor: btLoading ? "default" : "pointer", pointerEvents: btLoading ? "none" : "auto" }}
+              />
+            </div>
+            <span style={{ color:"#9ca3af", fontSize:12 }}>to</span>
+            <div style={{ position:"relative", display:"flex", alignItems:"center" }}>
+              <input
+                ref={customEndRef}
+                type="date" disabled={btLoading} value={customEnd} min={customStart || undefined}
+                onChange={e => setCustomEnd(e.target.value)}
+                className="date-input-custom-icon"
+                style={{ padding:"4px 26px 4px 8px", borderRadius:6, border:"1px solid #e5e7eb", fontSize:12, color:"#374151" }}
+              />
+              <CalendarClock
+                size={14} strokeWidth={2}
+                onClick={() => customEndRef.current?.showPicker?.() ?? customEndRef.current?.focus()}
+                style={{ position:"absolute", right:7, color:"#9ca3af", cursor: btLoading ? "default" : "pointer", pointerEvents: btLoading ? "none" : "auto" }}
+              />
+            </div>
           </div>
           <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
           <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>RR</span>
@@ -953,6 +1281,22 @@ function ScreenerBacktestPage({ market, onBack }) {
           {btLoading && <span style={{ fontSize:11, color:"#9ca3af" }}>Loading…</span>}
           <RRCustomInput value={btRrMode} onChange={setBtRrMode} disabled={btLoading}/>
         </div>
+
+        {availableTimeframes.length > 0 && (
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:16, flexWrap:"wrap" }}>
+            <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Timeframe</span>
+            <div style={{ display:"flex", gap:4, flexWrap:"wrap" }}>
+              {["All", ...availableTimeframes].map(tf => (
+                <button key={tf} onClick={()=>setBtTimeframeFilter(tf)} style={{
+                  padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700, cursor:"pointer",
+                  border: btTimeframeFilter===tf ? "1.5px solid #6366f1" : "1px solid #e5e7eb",
+                  background: btTimeframeFilter===tf ? "#eef2ff" : "#fff",
+                  color: btTimeframeFilter===tf ? "#6366f1" : "#6b7280",
+                }}>{tf}</button>
+              ))}
+            </div>
+          </div>
+        )}
 
         {btError ? (
           <div style={{ padding:48, textAlign:"center", color:"#dc2626", fontSize:14, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
@@ -1021,6 +1365,7 @@ function ScreenerBacktestPage({ market, onBack }) {
                             <span style={{ color:"#f59e0b" }}>{t.symbol.replace("/USDT","")}</span>
                             <span style={{ color:"#9ca3af", fontSize:10 }}>/USDT</span>
                           </td>
+                          <td style={{ padding:"10px 14px", color:"#6b7280", fontSize:11 }}>{t.timeFrame}</td>
                           <td style={{ padding:"10px 14px" }}>
                             <span style={{
                               display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11,
@@ -1077,6 +1422,10 @@ function ScreenerBacktestPage({ market, onBack }) {
           </div>
         )}
       </div>
+      <style>{`
+        .date-input-custom-icon::-webkit-calendar-picker-indicator{opacity:0;position:absolute;right:0;width:26px;height:100%;cursor:pointer;}
+        .date-input-custom-icon::-webkit-inner-spin-button{display:none;}
+      `}</style>
     </div>
   );
 }
@@ -1093,8 +1442,9 @@ const CROSS_COLS = [
 
 const BCOLS = [
   {k:"symbol",        l:"Symbol"},
+  {k:"timeFrame",     l:"Timeframe"},
   {k:"tradeSignal",   l:"Signal Type"},
-  {k:"signalTime",    l:"Signal Time"},
+  {k:"_signalTimeMs", l:"Signal Time"},
   {k:"_entryTimeMs",  l:"Entry Time"},
   {k:"entryPrice",    l:"Entry Price",    r:true},
   {k:"stopLoss",      l:"Stop Loss",      r:true},
@@ -1135,13 +1485,14 @@ function DetailsPage({ row, market, onBack, onBacktest }) {
         if (!res.ok) throw new Error(`API ${res.status}`);
         const data = await res.json();
 
-        // The backend occasionally stores the same crossover twice (near-identical
-        // cross_time a few hundred ms apart, from separate scan runs) — collapse
-        // those down to one row per type/minute before displaying.
+        // The backend can end up with more than one stored row for the same
+        // crossover (re-scans recomputing a slightly different interpolated
+        // cross_time, sometimes minutes apart) — collapse by which candle the
+        // signal actually falls into, since that's what determines its entry.
         const seen = new Map();
         for (const s of data) {
           const crossTimeMs = new Date(s.cross_time).getTime();
-          const dedupeKey = `${s.signal_type}|${Math.round(crossTimeMs / 60000)}`;
+          const dedupeKey = `${s.signal_type}|${Math.floor(crossTimeMs / CANDLE_MS_MAP[tf])}`;
           if (!seen.has(dedupeKey)) seen.set(dedupeKey, { ...s, interval: tf, crossTimeMs });
         }
         const dedupedSignals = [...seen.values()];
@@ -1279,6 +1630,17 @@ const TIMEFRAMES = ["1h", "2h", "4h", "6h"];
 const CANDLE_MS_MAP = {"1h":3_600_000,"2h":7_200_000,"4h":14_400_000,"6h":21_600_000};
 const LIMIT_MAP     = {"1h":1500,"2h":900,"4h":570,"6h":450};
 
+// Generic Binance-style interval -> milliseconds (5m/15m/30m/1h/4h/1d/...),
+// unlike CANDLE_MS_MAP above which only covers the old scanner's fixed set —
+// CSV-imported signals can be on any interval, so backtest pages that read
+// CSV data need this instead.
+function intervalToMs(interval) {
+  const m = /^(\d+)([mhdwM])$/.exec(interval || "");
+  if (!m) return 3_600_000;
+  const unitMs = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000, M: 2_592_000_000 };
+  return parseInt(m[1], 10) * unitMs[m[2]];
+}
+
 function StatCard({ label, value, color }) {
   return (
     <div style={{ background:"#f8f9fb", borderRadius:10, padding:"14px 18px", border:"1px solid #e8eaed", minWidth:110 }}>
@@ -1288,72 +1650,134 @@ function StatCard({ label, value, color }) {
   );
 }
 
-function BacktestPage({ scanRow, initialMarket, onBack }) {
-  const market = initialMarket || "futures";
+function BacktestPage({ scanRow, onBack }) {
   const [rrMode, setRrMode]       = useState("1:2");
   const [capital, setCapital]     = useState(1000);
   const [window, setWindow]       = useState(7);
-  const [timeframe, setTimeframe] = useState("1h");
+  const [timeframe, setTimeframe] = useState(scanRow?.interval || "1h");
   const [candles, setCandles]     = useState(null);
+  const [multiCandles, setMultiCandles] = useState(null); // Map<interval, candles[]> — only populated when timeframe === "All"
   const [dbSignals, setDbSignals] = useState(null);  // signals fetched from DB
   const [trades, setTrades]       = useState(null);
   const [loading, setLoading]     = useState(true);
   const [error, setError]         = useState(null);
   const [reloading, setReloading] = useState(false);
   const [sort, setSort]           = useState({ k:"_entryTimeMs", dir:"desc" });
+  const [symbolSignals, setSymbolSignals] = useState([]); // every CSV signal for this symbol, any interval
 
   const symbol = scanRow?.symbol || "BTCUSDT";
   const { base } = fmtSym(symbol);
   const fetchIdRef = useRef(0);
 
-  // Fetch candles + signals from DB together
+  // A CSV can carry signals for the same coin at several different
+  // timeframes (5m/15m/1h/...) — load them all once so we know exactly
+  // which timeframes exist for THIS coin, instead of assuming a fixed set.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/csv-signals`);
+        if (!res.ok || cancelled) return;
+        const all = await res.json();
+        if (cancelled) return;
+        const forSymbol = all.filter(s => s.symbol === symbol);
+        setSymbolSignals(forSymbol);
+        const intervals = [...new Set(forSymbol.map(s => s.interval))].sort();
+        setTimeframe(t => {
+          if (intervals.length === 0) return t;
+          if (intervals.includes(t)) return t;
+          return intervals.includes(scanRow?.interval) ? scanRow.interval : intervals[0];
+        });
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol]);
+
+  // Memoized so its array identity only changes when symbolSignals actually
+  // does — it's a dependency of the fetchData useCallback below, and a
+  // fresh array reference on every render there caused an infinite
+  // fetch loop (fetchData's identity would change every render, re-running
+  // the effect that calls it, which triggers the render that recomputes
+  // this again, forever — matches the repeating identical requests seen).
+  const availableIntervals = useMemo(
+    () => [...new Set(symbolSignals.map(s => s.interval))].sort(),
+    [symbolSignals]
+  );
+
+  // Fetches ONE interval's candles for `symbol` — ensuring deeper history
+  // from Binance first if the selected Window needs more than the ~1000
+  // candles the bulk CSV import stores per coin (see ensure-depth docstring
+  // in csv_import.py). Shared by both the single-timeframe path and the
+  // "All" path below, which just calls this once per available interval.
+  const fetchCandlesFor = useCallback(async (iv, requestId) => {
+    const neededCandles = Math.ceil((window * 86_400_000) / intervalToMs(iv)) + 50;
+    if (neededCandles > 1000) {
+      try {
+        await fetch(`${API_BASE}/csv-candles/${symbol}/ensure-depth?interval=${iv}&days=${window}`, { method: "POST" });
+      } catch {
+        // Non-fatal — fall through and show whatever history is already stored.
+      }
+      if (fetchIdRef.current !== requestId) return null;
+    }
+    const candleLimit = Math.min(20_000, Math.max(1000, neededCandles));
+    const res = await fetch(`${API_BASE}/csv-candles/${symbol}?interval=${iv}&limit=${candleLimit}`);
+    if (!res.ok) {
+      if (res.status === 404) return []; // no stored candles for this interval yet — not fatal for the "All" view
+      const detail = await res.json().catch(() => ({}));
+      throw new Error(detail?.detail || `Candles API ${res.status}`);
+    }
+    const rawCandles = await res.json();
+    return rawCandles.map(r => ({
+      symbol, openTimeMs: r[0],
+      open: parseFloat(r[1]), high: parseFloat(r[2]), low: parseFloat(r[3]),
+      close: parseFloat(r[4]), volume: parseFloat(r[5]),
+    }));
+  }, [symbol, window]);
+
+  // Fetch this coin's candles for the selected timeframe (or, if "All" is
+  // selected, every timeframe this coin has signals for) from the CSV store.
   const fetchData = useCallback(async () => {
-    // Guards against out-of-order responses: if the symbol/timeframe/market
-    // changes again before this request lands, a slower older request must
-    // not be allowed to clobber the newer one's state once it resolves.
+    // Guards against out-of-order responses: if the symbol/timeframe changes
+    // again before this request lands, a slower older request must not be
+    // allowed to clobber the newer one's state once it resolves.
     const requestId = ++fetchIdRef.current;
     setReloading(true);
     setError(null);
     try {
-      const limit = LIMIT_MAP[timeframe] || 1500;
-      const [candleRes, signalRes] = await Promise.all([
-        fetch(`${API_BASE}/candles/${symbol}?interval=${timeframe}&market=${market}&limit=${limit}`),
-        fetch(`${API_BASE}/signals?symbol=${symbol}&interval=${timeframe}&market=${market}&days=30&limit=500`),
-      ]);
-      if (!candleRes.ok) {
-        const detail = await candleRes.json().catch(() => ({}));
-        throw new Error(detail?.detail || `Candles API ${candleRes.status}`);
+      if (timeframe === "All") {
+        const map = new Map();
+        for (const iv of availableIntervals) {
+          const parsedCandles = await fetchCandlesFor(iv, requestId);
+          if (fetchIdRef.current !== requestId) return;
+          if (parsedCandles) map.set(iv, parsedCandles);
+        }
+        if (fetchIdRef.current !== requestId) return;
+        setMultiCandles(map);
+        setCandles(null);
+        setDbSignals(null);
+        return;
       }
-      const rawCandles = await candleRes.json();
-      const parsedCandles = rawCandles.map(r => ({
-        symbol,
-        openTimeMs: r[0],
-        open:   parseFloat(r[1]),
-        high:   parseFloat(r[2]),
-        low:    parseFloat(r[3]),
-        close:  parseFloat(r[4]),
-        volume: parseFloat(r[5]),
-      }));
 
-      // DB signals — sorted oldest first for simulation
-      let rawSignals = [];
-      if (signalRes.ok) {
-        rawSignals = await signalRes.json();
-      }
-      // cross_time from API is ISO string, convert to ms
-      // The backend occasionally stores the same crossover twice (near-identical
-      // cross_time a few hundred ms apart, from separate scan runs) — collapse
-      // those down to one signal per type/minute before simulating trades.
+      const parsedCandles = await fetchCandlesFor(timeframe, requestId);
+      if (fetchIdRef.current !== requestId) return;
+
+      // The CSV can carry more than one stored row for the same crossover
+      // (re-uploads, slightly different interpolated cross_time) — collapse
+      // by which candle the signal actually falls into, since that's what
+      // determines its entry.
+      const candleMs = intervalToMs(timeframe);
       const seenSignals = new Map();
-      for (const s of rawSignals) {
+      for (const s of symbolSignals) {
+        if (s.interval !== timeframe) continue;
         const crossTimeMs = new Date(s.cross_time).getTime();
-        const dedupeKey = `${s.signal_type}|${Math.round(crossTimeMs / 60000)}`;
+        const dedupeKey = `${s.signal_type}|${Math.floor(crossTimeMs / candleMs)}`;
         if (!seenSignals.has(dedupeKey)) {
           seenSignals.set(dedupeKey, {
             type:        s.signal_type,           // "BUY" | "SELL"
             crossPrice:  s.cross_price,
             crossTimeMs,
-            ema7:  s.ema_7, ema25: s.ema_25, ema99: s.ema_99,
+            ema7:  s.ema_fast, ema25: s.ema_mid, ema99: s.ema_slow,
           });
         }
       }
@@ -1361,6 +1785,7 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
       const parsedSignals = [...seenSignals.values()].sort((a, b) => a.crossTimeMs - b.crossTimeMs);
 
       if (fetchIdRef.current !== requestId) return; // a newer request has since superseded this one
+      setMultiCandles(null);
       setCandles(parsedCandles);
       setDbSignals(parsedSignals);
     } catch(e) {
@@ -1371,32 +1796,47 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
         setReloading(false);
       }
     }
-  }, [symbol, timeframe, market]);
+  }, [symbol, timeframe, symbolSignals, window, availableIntervals, fetchCandlesFor]);
 
   useEffect(() => {
     setLoading(true);
     setCandles(null);
+    setMultiCandles(null);
     setDbSignals(null);
     setTrades(null);
     fetchData();
   }, [fetchData]);
 
-  // Auto-refresh every 20s so OPEN trades pick up SL/TP hits from fresh
-  // candle data without needing a manual Reload click.
-  useEffect(() => {
-    const id = setInterval(fetchData, 20000);
-    return () => clearInterval(id);
-  }, [fetchData]);
-
   // Re-run simulation whenever candles, signals, rrMode, or window changes.
-  // Every timeframe now stores its own signals in the DB using the identical
-  // detection condition — so all of them use the same DB-signal simulation
-  // path, no client-side EMA recomputation.
   useEffect(() => {
-    if (candles && dbSignals) {
-      setTrades(runBacktestFromSignals(candles, dbSignals, rrMode, window, CANDLE_MS_MAP[timeframe], timeframe, capital));
+    if (timeframe === "All") {
+      if (!multiCandles) return;
+      const merged = [];
+      for (const iv of availableIntervals) {
+        const ivCandles = multiCandles.get(iv);
+        if (!ivCandles || ivCandles.length === 0) continue;
+        const candleMs = intervalToMs(iv);
+        const seenSignals = new Map();
+        for (const s of symbolSignals) {
+          if (s.interval !== iv) continue;
+          const crossTimeMs = new Date(s.cross_time).getTime();
+          const dedupeKey = `${s.signal_type}|${Math.floor(crossTimeMs / candleMs)}`;
+          if (!seenSignals.has(dedupeKey)) {
+            seenSignals.set(dedupeKey, {
+              type: s.signal_type, crossPrice: s.cross_price, crossTimeMs,
+              ema7: s.ema_fast, ema25: s.ema_mid, ema99: s.ema_slow,
+            });
+          }
+        }
+        const ivSignals = [...seenSignals.values()].sort((a, b) => a.crossTimeMs - b.crossTimeMs);
+        if (ivSignals.length === 0) continue;
+        merged.push(...runBacktestFromSignals(ivCandles, ivSignals, rrMode, window, candleMs, iv, capital));
+      }
+      setTrades(merged);
+    } else if (candles && dbSignals) {
+      setTrades(runBacktestFromSignals(candles, dbSignals, rrMode, window, intervalToMs(timeframe), timeframe, capital));
     }
-  }, [candles, dbSignals, rrMode, window, timeframe, capital]);
+  }, [candles, dbSignals, multiCandles, rrMode, window, timeframe, capital, availableIntervals, symbolSignals]);
 
   const sortedTrades = trades ? [...trades].sort((a,b)=>{
     const dir = sort.dir==="asc"?1:-1;
@@ -1480,7 +1920,15 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
         ))}
         <div style={{ width:1, height:20, background:"#e5e7eb", marginLeft:8 }}/>
         <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Timeframe</span>
-        {TIMEFRAMES.map(tf => (
+        {availableIntervals.length > 1 && (
+          <button onClick={()=>setTimeframe("All")} style={{
+            padding:"4px 14px", borderRadius:6, fontSize:12, fontWeight:600, cursor:"pointer",
+            border:timeframe==="All"?"1.5px solid #6366f1":"1px solid #e5e7eb",
+            background:"transparent", color:timeframe==="All"?"#6366f1":"#6b7280",
+            transition:"all 0.15s",
+          }}>All</button>
+        )}
+        {(availableIntervals.length > 0 ? availableIntervals : [timeframe]).map(tf => (
           <button key={tf} onClick={()=>setTimeframe(tf)} style={{
             padding:"4px 14px", borderRadius:6, fontSize:12, fontWeight:600, cursor:"pointer",
             border:timeframe===tf?"1.5px solid #6366f1":"1px solid #e5e7eb",
@@ -1547,6 +1995,8 @@ function BacktestPage({ scanRow, initialMarket, onBack }) {
                       <span style={{ color:"#f59e0b" }}>{t.symbol.replace("/USDT","")}</span>
                       <span style={{ color:"#9ca3af", fontSize:10 }}>/USDT</span>
                     </td>
+                    {/* Timeframe */}
+                    <td style={{ padding:"10px 14px", color:"#6b7280", fontSize:11 }}>{t.timeFrame}</td>
                     {/* Signal Type */}
                     <td style={{ padding:"10px 14px" }}>
                       <span style={{
@@ -1658,8 +2108,19 @@ export default function App() {
     setPage(backtestFrom);
   }, [backtestFrom]);
 
-  if (page === "backtest")           return <BacktestPage scanRow={scanRow} initialMarket={market} onBack={goBackFromBacktest}/>;
-  if (page === "details")            return <DetailsPage row={detailsRow} market={market} onBack={goBackFromDetails} onBacktest={goBacktest}/>;
-  if (page === "screener-backtest")  return <ScreenerBacktestPage market={market} onBack={goBackFromDetails}/>;
-  return <ScannerPage market={market} setMarket={setMarket} onDetails={goDetails} onBacktest={goBacktest} onScreenerBacktest={goScreenerBacktest}/>;
+  // ScannerPage stays mounted at all times (just hidden, not unmounted) so
+  // its already-loaded CSV data survives navigating to Backtest/Backtest
+  // Summary and back — clicking "Back" used to remount it from scratch,
+  // throwing away everything it had already fetched and forcing a full
+  // reload every single time.
+  return (
+    <>
+      <div style={{ display: page === "scanner" ? "block" : "none" }}>
+        <ScannerPage onBacktest={goBacktest} onScreenerBacktest={goScreenerBacktest}/>
+      </div>
+      {page === "backtest" && <BacktestPage scanRow={scanRow} onBack={goBackFromBacktest}/>}
+      {page === "details" && <DetailsPage row={detailsRow} market={market} onBack={goBackFromDetails} onBacktest={goBacktest}/>}
+      {page === "screener-backtest" && <ScreenerBacktestPage onBack={goBackFromDetails}/>}
+    </>
+  );
 }
