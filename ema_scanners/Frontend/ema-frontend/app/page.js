@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
 import { TrendingUp, TrendingDown, Target, Database, CheckCircle2, XCircle, DollarSign, Award, CalendarClock } from "lucide-react";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8001/api";
 
 const MARKETS = ["futures", "spot"];
 
@@ -1162,7 +1162,38 @@ function ScreenerBacktestPage({ onBack }) {
         ].map(csvEscape).join(","));
       }
 
-      const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      // Summary block — same Won/Loss/Win Rate/PnL($) math as the on-screen
+      // stat cards (btStats above), broken down per period plus a grand total.
+      const summaryFor = rows => {
+        const won = rows.filter(t => t.result === "WIN").length;
+        const lost = rows.filter(t => t.result === "LOSS").length;
+        const closed = rows.filter(t => t.result === "WIN" || t.result === "LOSS");
+        const pnlDollar = closed.reduce((sum, t) => sum + t.gainDollar, 0);
+        const winRate = closed.length > 0 ? (won / closed.length) * 100 : null;
+        return { total: rows.length, won, lost, winRate, pnlDollar };
+      };
+
+      lines.push("");
+      lines.push("Summary");
+      lines.push(["Period","Total Trades","Won","Loss","Win Rate %","PnL ($)"].map(csvEscape).join(","));
+      for (const period of ["day", "week", "month"]) {
+        const s = summaryFor(allRows.filter(t => t.period === period));
+        lines.push([
+          period.toUpperCase(), s.total, s.won, s.lost,
+          s.winRate != null ? s.winRate.toFixed(1) : "—",
+          s.pnlDollar.toFixed(2),
+        ].map(csvEscape).join(","));
+      }
+      const overall = summaryFor(allRows);
+      lines.push([
+        "TOTAL", overall.total, overall.won, overall.lost,
+        overall.winRate != null ? overall.winRate.toFixed(1) : "—",
+        overall.pnlDollar.toFixed(2),
+      ].map(csvEscape).join(","));
+
+      // Leading BOM so Excel detects UTF-8 and renders "—" correctly instead
+      // of the mojibake "â€"" it shows without one.
+      const blob = new Blob(["﻿" + lines.join("\n")], { type: "text/csv;charset=utf-8;" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;

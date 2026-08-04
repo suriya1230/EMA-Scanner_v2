@@ -166,6 +166,10 @@ class CandleRepository:
 
 class ImportedSignalRepository:
 
+    # Same 32,767 bind-parameter ceiling as CandleRepository above — a CSV
+    # with thousands of rows can blow past it in one INSERT, so chunk here too.
+    _INSERT_CHUNK_SIZE = 2000
+
     @staticmethod
     async def replace_all(session: AsyncSession, rows: list[dict]) -> int:
         """Wipes any previously-imported CSV signals and inserts this new
@@ -174,7 +178,10 @@ class ImportedSignalRepository:
         await session.execute(delete(ImportedSignal))
         if not rows:
             return 0
-        await session.execute(pg_insert(ImportedSignal).values(rows))
+        chunk_size = ImportedSignalRepository._INSERT_CHUNK_SIZE
+        for i in range(0, len(rows), chunk_size):
+            chunk = rows[i:i + chunk_size]
+            await session.execute(pg_insert(ImportedSignal).values(chunk))
         return len(rows)
 
     @staticmethod
