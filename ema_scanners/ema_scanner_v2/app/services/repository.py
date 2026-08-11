@@ -133,6 +133,26 @@ class CandleRepository:
         return list(result.scalars().all())
 
     @staticmethod
+    async def get_closes_by_symbol(
+        session: AsyncSession,
+        interval: str = "1h",
+        market: str = "futures",
+    ) -> dict[str, list[float]]:
+        """All stored close prices per symbol for market+interval, ascending
+        by open_time — used to compute an EMA trend per coin without
+        re-fetching anything from Binance. Rows come back pre-sorted by
+        symbol then open_time, so grouping is a single linear pass."""
+        result = await session.execute(
+            select(Candle.symbol, Candle.close)
+            .where(Candle.market == market, Candle.interval == interval)
+            .order_by(Candle.symbol.asc(), Candle.open_time.asc())
+        )
+        closes_by_symbol: dict[str, list[float]] = {}
+        for symbol, close in result.all():
+            closes_by_symbol.setdefault(symbol, []).append(close)
+        return closes_by_symbol
+
+    @staticmethod
     async def prune_old_candles(
         session: AsyncSession,
         symbol: str,

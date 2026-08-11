@@ -421,7 +421,7 @@ const CSV_CANDLE_CONCURRENCY = 15;
 // live DOM small regardless of how many rows match the current filters.
 const CSV_PAGE_SIZE = 50;
 
-function ScannerPageImpl({ onBacktest, onScreenerBacktest }) {
+function ScannerPageImpl({ onBacktest, onScreenerBacktest, onHome }) {
   const [modal, setModal] = useState(null);
   const [csvUploading, setCsvUploading] = useState(false);
   const [csvUploadError, setCsvUploadError] = useState(null);
@@ -601,10 +601,17 @@ function ScannerPageImpl({ onBacktest, onScreenerBacktest }) {
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
       {/* Header */}
       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"20px 24px 16px", flexWrap:"wrap", gap:12 }}>
-        <div>
-          <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>EMA SCANNER</div>
-          <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
-            TRIPLE EMA STRATEGY 7 › 25 › 99
+        <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+          <button onClick={onHome} style={{
+            display:"flex", alignItems:"center", gap:5, padding:"5px 12px",
+            borderRadius:7, border:"1px solid #e5e7eb", background:"transparent",
+            fontSize:12, fontWeight:600, color:"#374151", cursor:"pointer",
+          }}>← Home</button>
+          <div>
+            <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>EMA SCANNER</div>
+            <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
+              TRIPLE EMA STRATEGY 7 › 25 › 99
+            </div>
           </div>
         </div>
         {/* Once there's data, this same Upload CSV button (and Backtest
@@ -2102,9 +2109,257 @@ function BacktestPage({ scanRow, onBack }) {
   );
 }
 
+// ─── Home Page (coin universe — stored/Bullish/Bearish counts + full list) ───
+// Landing page: shows every coin the Universe Collector has stored candles
+// for (see universe_collector.py / universe_summary.py on the backend),
+// each tagged with its current EMA 7/25/99 trend, computed purely from
+// stored DB data — separate from the CSV-driven Scanner/EMA Crossover page.
+const HOME_PAGE_SIZE = 50;
+const HOME_COLS = [
+  {k:"rank",         l:"#",         s:false},
+  {k:"symbol",       l:"Symbol",    s:true},
+  {k:"trend",        l:"EMA Trend", s:true},
+  {k:"price",        l:"Price",     s:true, r:true},
+  {k:"candle_count", l:"Candles",   s:true, r:true},
+];
+
+function HomePage({ onOpenScanner }) {
+  const [summary, setSummary]       = useState(null);
+  const [loading, setLoading]       = useState(true);
+  const [error, setError]           = useState(null);
+  const [collecting, setCollecting] = useState(false);
+  const [collectMsg, setCollectMsg] = useState(null);
+  const [search, setSearch]         = useState("");
+  const [trendFilter, setTrendFilter] = useState("All");
+  const [sort, setSort]             = useState({ k:"symbol", dir:"asc" });
+  const [homePage, setHomePage]     = useState(1);
+
+  const loadSummary = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/universe-summary`);
+      if (!res.ok) throw new Error(`API ${res.status}`);
+      setSummary(await res.json());
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadSummary(); }, [loadSummary]);
+
+  // Kicks off the backend's Binance scan + candle backfill for every coin
+  // with 24h volume >= $1M, then reloads the summary to reflect what got
+  // stored — this can take a while for hundreds of coins.
+  const handleCollect = async () => {
+    setCollecting(true);
+    setCollectMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/collect-universe`, { method: "POST" });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail || `API ${res.status}`);
+      }
+      const result = await res.json();
+      setCollectMsg(
+        `Stored ${result.pairs_stored}/${result.pairs_attempted} coin×timeframe pair(s) across ` +
+        `${result.symbols_scanned} coin(s) (${result.intervals.join(", ")})` +
+        (result.errors?.length ? ` — ${result.errors.length} failed.` : ".")
+      );
+      loadSummary();
+    } catch (e) {
+      setCollectMsg(`Collect failed: ${e.message}`);
+    } finally {
+      setCollecting(false);
+    }
+  };
+
+  const coins = summary?.coins || [];
+  const toggleSort = k => setSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"asc"});
+
+  const filteredCoins = useMemo(() => coins.filter(c => {
+    if (trendFilter !== "All" && (c.trend || "Insufficient Data") !== trendFilter) return false;
+    if (search && !c.symbol.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  }), [coins, trendFilter, search]);
+
+  const sortedCoins = useMemo(() => [...filteredCoins].sort((a, b) => {
+    const dir = sort.dir === "asc" ? 1 : -1;
+    const av = a[sort.k], bv = b[sort.k];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1; if (bv == null) return -1;
+    return typeof av === "string" ? dir*av.localeCompare(bv) : dir*(av-bv);
+  }), [filteredCoins, sort]);
+
+  const homePageCount = Math.max(1, Math.ceil(sortedCoins.length / HOME_PAGE_SIZE));
+  useEffect(() => {
+    if (homePage > homePageCount) setHomePage(homePageCount);
+  }, [homePage, homePageCount]);
+  useEffect(() => { setHomePage(1); }, [trendFilter, search, sort]);
+  const homePageRows = useMemo(() => {
+    const start = (homePage - 1) * HOME_PAGE_SIZE;
+    return sortedCoins.slice(start, start + HOME_PAGE_SIZE);
+  }, [sortedCoins, homePage]);
+
+  return (
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"20px 24px 16px", flexWrap:"wrap", gap:12 }}>
+        <div>
+          <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>COIN UNIVERSE</div>
+          <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
+            ALL STORED COINS
+          </div>
+        </div>
+        <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+          <button onClick={handleCollect} disabled={collecting} style={{
+            padding:"7px 16px", borderRadius:8, border:"1px solid #e5e7eb",
+            background:"#fff", color:"#374151", fontSize:12, fontWeight:700,
+            cursor: collecting ? "not-allowed" : "pointer", opacity: collecting ? 0.6 : 1,
+          }}>{collecting ? "Collecting…" : "↻ Collect Universe"}</button>
+          <button onClick={onOpenScanner} style={{
+            padding:"8px 18px", borderRadius:8, border:"none",
+            background:"#6366f1", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer",
+          }}>EMA Crossover →</button>
+        </div>
+      </div>
+
+      {collectMsg && (
+        <div style={{ margin:"0 24px 16px", background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", padding:"12px 20px", fontSize:12, color:"#374151" }}>
+          {collectMsg}
+        </div>
+      )}
+
+      {loading ? (
+        <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:13 }}>Loading coin universe…</div>
+      ) : error ? (
+        <div style={{ margin:"0 24px 16px", padding:24, textAlign:"center", color:"#dc2626", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>⚠ {error}</div>
+      ) : coins.length === 0 ? (
+        <div style={{ margin:"0 24px 16px", padding:60, textAlign:"center", color:"#9ca3af", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
+          No coins stored yet — click "Collect Universe" to fetch and store every coin with 24h volume ≥ $1M.
+        </div>
+      ) : (
+        <>
+          {/* Summary cards */}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:16, padding:"0 24px 16px" }}>
+            <SummaryCard
+              label="Stored" badge={`${summary.market.toUpperCase()} ${summary.interval.toUpperCase()}`} badgeBg="#111827" badgeColor="#fff"
+              value={summary.symbols_stored} valueColor="#111827" bg="#e7e7fb" Icon={Database}
+            />
+            <SummaryCard
+              label="Bullish" badge="UP" badgeBg="#bbf1d3" badgeColor="#166534"
+              value={summary.bullish} valueColor="#16a34a" bg="#e7f8ef" Icon={TrendingUp}
+            />
+            <SummaryCard
+              label="Bearish" badge="DOWN" badgeBg="#fbcfd1" badgeColor="#991b1b"
+              value={summary.bearish} valueColor="#dc2626" bg="#fdecec" Icon={TrendingDown}
+            />
+            <SummaryCard
+              label="Neutral" badge="FLAT" badgeBg="#e5e7eb" badgeColor="#374151"
+              value={summary.neutral} valueColor="#6b7280" bg="#f3f4f6" Icon={Target}
+            />
+          </div>
+
+          {/* Search */}
+          <div style={{ padding:"0 24px 12px" }}>
+            <div style={{ position:"relative", maxWidth:260 }}>
+              <span style={{ position:"absolute", left:14, top:"50%", transform:"translateY(-50%)", color:"#9ca3af", fontSize:13 }}>⌕</span>
+              <input placeholder="Search coins…" value={search} onChange={e=>setSearch(e.target.value)} style={{
+                width:"100%", padding:"9px 14px 9px 32px", borderRadius:10, border:"1px solid #e5e7eb", fontSize:13,
+                color:"#374151", outline:"none", background:"#fff", boxSizing:"border-box",
+              }}/>
+            </div>
+            <div style={{ marginTop:8, fontSize:12, color:"#9ca3af" }}>
+              <strong style={{ color:"#374151" }}>{sortedCoins.length}</strong> coins
+            </div>
+          </div>
+
+          {/* Filters */}
+          <div style={{ padding:"16px 24px", display:"flex", alignItems:"center", gap:16, flexWrap:"wrap", borderTop:"1px solid #e5e7eb", borderBottom:"1px solid #e5e7eb" }}>
+            <div style={{ display:"flex", gap:4 }}>
+              {["All","Bullish","Bearish","Neutral"].map(t => (
+                <button key={t} onClick={()=>setTrendFilter(t)} style={{
+                  padding:"6px 16px", borderRadius:8, fontSize:12, fontWeight:700, cursor:"pointer",
+                  border: trendFilter===t ? "1px solid #111827" : "1px solid #e5e7eb",
+                  background: trendFilter===t ? "#111827" : "#fff",
+                  color: trendFilter===t ? "#fff" : "#6b7280", textTransform:"uppercase",
+                }}>{t}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Table */}
+          <div style={{ margin:"16px 24px 24px", background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"hidden" }}>
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+                <thead>
+                  <tr>
+                    {HOME_COLS.map(col => (
+                      <TH key={col.k} right={col.r} onClick={col.s?()=>toggleSort(col.k):null}
+                        sorted={sort.k===col.k} dir={sort.dir}>{col.l}</TH>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {homePageRows.length === 0 ? (
+                    <tr><td colSpan={HOME_COLS.length} style={{ padding:48, textAlign:"center", color:"#9ca3af", fontSize:13 }}>No coins match your filters.</td></tr>
+                  ) : homePageRows.map((c, iOnPage) => {
+                    const i = (homePage - 1) * HOME_PAGE_SIZE + iOnPage;
+                    const { base, quote } = fmtSym(c.symbol);
+                    return (
+                      <tr key={c.symbol}
+                        style={{ borderBottom:"1px solid #f3f4f6", background:i%2===0?"#fff":"#fafafa" }}
+                        onMouseEnter={e=>e.currentTarget.style.background="#f0f9ff"}
+                        onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"#fff":"#fafafa"}
+                      >
+                        <td style={{ padding:"11px 14px", color:"#9ca3af", fontWeight:500 }}>{i + 1}</td>
+                        <td style={{ padding:"11px 14px", fontWeight:700 }}>
+                          <span style={{ color:"#f59e0b" }}>{base}</span>
+                          <span style={{ color:"#9ca3af", fontSize:11 }}>{quote}</span>
+                        </td>
+                        <td style={{ padding:"11px 14px" }}>
+                          {c.trend ? <Trend t={c.trend}/> : <span style={{ color:"#d1d5db", fontSize:12 }}>Insufficient data</span>}
+                        </td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:500 }}>{fmtPrice(c.price)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#9ca3af", fontVariantNumeric:"tabular-nums" }}>{c.candle_count}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {sortedCoins.length > 0 && (
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"12px 16px", borderTop:"1px solid #e5e7eb" }}>
+                <span style={{ fontSize:12, color:"#9ca3af" }}>
+                  Showing {(homePage-1)*HOME_PAGE_SIZE+1}–{Math.min(homePage*HOME_PAGE_SIZE, sortedCoins.length)} of {sortedCoins.length}
+                </span>
+                <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                  <button onClick={()=>setHomePage(p=>Math.max(1,p-1))} disabled={homePage<=1} style={{
+                    padding:"6px 14px", borderRadius:7, fontSize:12, fontWeight:600,
+                    border:"1px solid #e5e7eb", background:"#fff", color:homePage<=1?"#d1d5db":"#374151",
+                    cursor:homePage<=1?"default":"pointer",
+                  }}>Prev</button>
+                  <span style={{ fontSize:12, color:"#6b7280" }}>Page {homePage} of {homePageCount}</span>
+                  <button onClick={()=>setHomePage(p=>Math.min(homePageCount,p+1))} disabled={homePage>=homePageCount} style={{
+                    padding:"6px 14px", borderRadius:7, fontSize:12, fontWeight:600,
+                    border:"1px solid #e5e7eb", background:"#fff", color:homePage>=homePageCount?"#d1d5db":"#374151",
+                    cursor:homePage>=homePageCount?"default":"pointer",
+                  }}>Next</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // ─── App router ───────────────────────────────────────────────────────────────
 export default function App() {
-  const [page, setPage]           = useState("scanner");
+  const [page, setPage]           = useState("home");
   const [market, setMarket]       = useState("futures");
   const [scanRow, setScanRow]     = useState(null);
   const [detailsRow, setDetailsRow] = useState(null);
@@ -2112,6 +2367,8 @@ export default function App() {
   // of always dropping to the scanner (e.g. Details -> Backtest -> Back should
   // land back on Details, not the scanner).
   const [backtestFrom, setBacktestFrom] = useState("scanner");
+
+  const goHome = useCallback(() => setPage("home"), []);
 
   const goDetails = useCallback(row => {
     setDetailsRow(row);
@@ -2146,8 +2403,9 @@ export default function App() {
   // reload every single time.
   return (
     <>
+      {page === "home" && <HomePage onOpenScanner={() => setPage("scanner")}/>}
       <div style={{ display: page === "scanner" ? "block" : "none" }}>
-        <ScannerPage onBacktest={goBacktest} onScreenerBacktest={goScreenerBacktest}/>
+        <ScannerPage onBacktest={goBacktest} onScreenerBacktest={goScreenerBacktest} onHome={goHome}/>
       </div>
       {page === "backtest" && <BacktestPage scanRow={scanRow} onBack={goBackFromBacktest}/>}
       {page === "details" && <DetailsPage row={detailsRow} market={market} onBack={goBackFromDetails} onBacktest={goBacktest}/>}

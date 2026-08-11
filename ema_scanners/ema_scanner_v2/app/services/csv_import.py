@@ -25,6 +25,7 @@ import pandas as pd
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.db.database import AsyncSessionLocal
+from app.services.rate_limit import throttle
 from app.services.repository import CandleRepository, ImportedSignalRepository
 
 logger = logging.getLogger(__name__)
@@ -56,10 +57,14 @@ RETRYABLE = (ccxt.NetworkError,)  # includes RateLimitExceeded/DDoSProtection/Ex
 
 
 async def _retry(fn, *args, **kwargs):
-    # A big CSV can reference hundreds of (symbol, interval) pairs fetched
+    # A big CSV (or the Universe Collector's per-symbol x per-interval fetch)
+    # can reference hundreds/thousands of (symbol, interval) pairs fetched
     # one after another — Binance rate-limit bans can last longer than a
     # few seconds, so this waits longer and tries more times than a single
-    # one-off request would need.
+    # one-off request would need. The adaptive throttle below is the
+    # primary defense (paces requests before they ever get rate-limited);
+    # this retry loop is the fallback for when a limit gets hit anyway.
+    client = getattr(fn, "__self__", None)  # bound ccxt client method, e.g. client.fetch_ohlcv
     async for attempt in AsyncRetrying(
         stop=stop_after_attempt(6),
         wait=wait_exponential(multiplier=1, min=2, max=60),
@@ -67,7 +72,12 @@ async def _retry(fn, *args, **kwargs):
         reraise=True,
     ):
         with attempt:
-            return await fn(*args, **kwargs)
+            if client is not None:
+                await throttle.wait()
+            result = await fn(*args, **kwargs)
+            if client is not None:
+                throttle.observe(client)
+            return result
 
 
 def _normalize_header(s: str) -> str:
