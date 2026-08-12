@@ -95,6 +95,9 @@ app.include_router(csv_backtest_router)
 from app.api.universe import router as universe_router  # noqa: E402
 app.include_router(universe_router)
 
+from app.api.swing_strategy import router as swing_strategy_router  # noqa: E402
+app.include_router(swing_strategy_router)
+
 
 # ─── Root ─────────────────────────────────────────────────────────────────────
 

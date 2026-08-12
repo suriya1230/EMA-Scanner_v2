@@ -153,6 +153,56 @@ class CandleRepository:
         return closes_by_symbol
 
     @staticmethod
+    async def get_ohlc_by_symbol(
+        session: AsyncSession,
+        interval: str = "1d",
+        market: str = "futures",
+    ) -> dict[str, list[dict]]:
+        """All stored OHLCV rows per symbol for market+interval, ascending by
+        open_time — used by the Swing Strategy screener to replay each
+        coin's full candle history in one pass without a separate query per
+        symbol. Rows come back pre-sorted by symbol then open_time, so
+        grouping is a single linear pass."""
+        result = await session.execute(
+            select(
+                Candle.symbol, Candle.open_time, Candle.open,
+                Candle.high, Candle.low, Candle.close, Candle.volume,
+            )
+            .where(Candle.market == market, Candle.interval == interval)
+            .order_by(Candle.symbol.asc(), Candle.open_time.asc())
+        )
+        rows_by_symbol: dict[str, list[dict]] = {}
+        for symbol, open_time, o, h, l, c, v in result.all():
+            rows_by_symbol.setdefault(symbol, []).append({
+                "open_time": open_time, "open": o, "high": h, "low": l, "close": c, "volume": v,
+            })
+        return rows_by_symbol
+
+    @staticmethod
+    async def get_ohlc_in_range(
+        session: AsyncSession,
+        symbol: str,
+        interval: str,
+        market: str,
+        start_time: int,
+        end_time: int,
+    ) -> list[dict]:
+        """High/low for symbol+market+interval within [start_time, end_time),
+        ascending by open_time — used by the Swing Strategy screener to
+        pinpoint a more precise intraday timestamp than a coarser
+        timeframe's candle boundary alone provides (e.g. narrowing a 1d
+        candle's "which day" down to "which hour" using stored 1h data)."""
+        result = await session.execute(
+            select(Candle.open_time, Candle.high, Candle.low)
+            .where(
+                Candle.symbol == symbol, Candle.market == market, Candle.interval == interval,
+                Candle.open_time >= start_time, Candle.open_time < end_time,
+            )
+            .order_by(Candle.open_time.asc())
+        )
+        return [{"open_time": ot, "high": h, "low": l} for ot, h, l in result.all()]
+
+    @staticmethod
     async def prune_old_candles(
         session: AsyncSession,
         symbol: str,

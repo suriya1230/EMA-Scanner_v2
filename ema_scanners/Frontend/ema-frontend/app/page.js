@@ -2361,12 +2361,87 @@ function HomePage({ onOpenScanner, onOpenSwing }) {
   );
 }
 
-// ─── Swing Strategy Page (placeholder — logic/conditions added later) ────────
-// Deliberately empty for now: a second screener beside the EMA Crossover
-// page, reached the same way (a button on Home). No fetch, no columns, no
-// logic yet — those get filled in once the swing strategy's actual
-// conditions are defined.
+// ─── Swing Strategy Page (Swing Zone Retest screener) ────────────────────────
+// Reads GET /api/swing-zones (see app/services/swing_strategy.py on the
+// backend) — every coin >= $10M 24h volume with a currently live
+// (ARMED/TRIGGERED) long or short zone, detected from 1d candles per the
+// swing-zone-retest rules (10% confirmation move, Z = swing candle's close,
+// 5% stop / 10% target). Purely a read: all detection runs server-side.
+const SWING_ALERT_BAND_PCT = 2; // rows within this distance to Z are the actionable watchlist
+// Backend direction values stay LONG/SHORT (matches the strategy spec's own
+// terminology) — displayed as BUY/SELL to match this app's SigBadge convention.
+const SWING_DIRECTION_LABEL = { LONG: "BUY", SHORT: "SELL" };
+const SWING_COLS = [
+  {k:"symbol",           l:"Symbol"},
+  {k:"direction",        l:"Direction"},
+  {k:"state",            l:"State"},
+  {k:"z",                l:"Z",              r:true},
+  {k:"price",            l:"Price",          r:true},
+  {k:"distance_pct",     l:"Distance %",     r:true},
+  {k:"sl",               l:"SL",             r:true},
+  {k:"tp",               l:"TP",             r:true},
+  {k:"confirm_move_pct", l:"Confirm Move %", r:true},
+  {k:"zone_age",         l:"Zone Age",       r:true},
+  {k:"detected_at",      l:"Detected Time",  r:true},
+  {k:"body_ratio",       l:"Body Ratio",     r:true},
+  {k:"swing_extreme",    l:"Swing Extreme",  r:true},
+];
+
 function SwingStrategyPage({ onHome }) {
+  const [data, setData]                 = useState(null);
+  const [loading, setLoading]           = useState(true);
+  const [error, setError]               = useState(null);
+  const [directionFilter, setDirectionFilter] = useState("All");
+  const [stateFilter, setStateFilter]   = useState("All");
+  const [sort, setSort]                 = useState({ k:"distance_pct", dir:"asc" });
+
+  // `silent` skips the loading flag so background polls don't blank the
+  // table out every few seconds — only the very first load (and a manual
+  // Refresh click) shows the "Scanning…" placeholder.
+  const load = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/swing-zones`);
+      if (!res.ok) throw new Error(`API ${res.status}`);
+      setData(await res.json());
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, []);
+
+  // Zones are computed live from candles the Live Stream keeps updating in
+  // real time — polling re-scans periodically so the dashboard tracks that
+  // without needing a manual refresh every time.
+  useEffect(() => {
+    load();
+    const id = setInterval(() => load({ silent: true }), 10_000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  const zones = data?.zones || [];
+  const toggleSort = k => setSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"asc"});
+
+  const filteredZones = useMemo(() => zones.filter(z => {
+    if (directionFilter !== "All" && z.direction !== directionFilter.toUpperCase()) return false;
+    if (stateFilter !== "All" && z.state !== stateFilter.toUpperCase()) return false;
+    return true;
+  }), [zones, directionFilter, stateFilter]);
+
+  // Distance % sorts by absolute value — it's the "how close to actionable"
+  // metric (spec's primary sort key), not a signed one where +5% and -5%
+  // should land at opposite ends of the list.
+  const sortedZones = useMemo(() => [...filteredZones].sort((a, b) => {
+    const dir = sort.dir === "asc" ? 1 : -1;
+    let av = a[sort.k], bv = b[sort.k];
+    if (sort.k === "distance_pct") { av = Math.abs(av); bv = Math.abs(bv); }
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1; if (bv == null) return -1;
+    return typeof av === "string" ? dir*av.localeCompare(bv) : dir*(av-bv);
+  }), [filteredZones, sort]);
+
   return (
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
       {/* Header */}
@@ -2380,15 +2455,119 @@ function SwingStrategyPage({ onHome }) {
           <div>
             <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>SWING STRATEGY</div>
             <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
-              SCREENER · NOT CONFIGURED YET
+              {data
+                ? `${data.timeframe.toUpperCase()} · ${(data.swing_threshold*100).toFixed(0)}% CONFIRM · ${(data.tp_pct*100).toFixed(0)}/${(data.sl_pct*100).toFixed(0)} TP/SL`
+                : "SWING ZONE RETEST"}
             </div>
           </div>
         </div>
+        <button onClick={() => load()} disabled={loading} style={{
+          padding:"7px 16px", borderRadius:8, border:"1px solid #e5e7eb",
+          background:"#fff", color:"#374151", fontSize:12, fontWeight:700,
+          cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.6 : 1,
+        }}>{loading ? "Scanning…" : "↻ Refresh"}</button>
       </div>
 
-      <div style={{ margin:"0 24px 24px", padding:60, textAlign:"center", color:"#9ca3af", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
-        No swing strategy logic configured yet.
-      </div>
+      {loading ? (
+        <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:13 }}>Scanning swing zones…</div>
+      ) : error ? (
+        <div style={{ margin:"0 24px 16px", padding:24, textAlign:"center", color:"#dc2626", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>⚠ {error}</div>
+      ) : zones.length === 0 ? (
+        <div style={{ margin:"0 24px 16px", padding:60, textAlign:"center", color:"#9ca3af", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
+          No live zones right now — needs coins with stored 1d candles and 24h volume ≥ ${((data?.min_volume_usdt ?? 5_000_000)/1e6).toFixed(0)}M.
+        </div>
+      ) : (
+        <>
+          <div style={{ padding:"0 24px 12px", fontSize:12, color:"#9ca3af" }}>
+            <strong style={{ color:"#374151" }}>{sortedZones.length}</strong> live zone(s) across{" "}
+            <strong style={{ color:"#374151" }}>{data.symbols_scanned}</strong> coin(s) ≥ ${(data.min_volume_usdt/1e6).toFixed(0)}M volume
+          </div>
+
+          {/* Filters */}
+          <div style={{ padding:"16px 24px", display:"flex", alignItems:"center", gap:16, flexWrap:"wrap", borderTop:"1px solid #e5e7eb", borderBottom:"1px solid #e5e7eb" }}>
+            <div style={{ display:"flex", gap:4 }}>
+              {["All","Long","Short"].map(d => (
+                <button key={d} onClick={()=>setDirectionFilter(d)} style={{
+                  padding:"6px 16px", borderRadius:8, fontSize:12, fontWeight:700, cursor:"pointer",
+                  border: directionFilter===d ? "1px solid #111827" : "1px solid #e5e7eb",
+                  background: directionFilter===d ? "#111827" : "#fff",
+                  color: directionFilter===d ? "#fff" : "#6b7280", textTransform:"uppercase",
+                }}>{d === "All" ? "All" : SWING_DIRECTION_LABEL[d.toUpperCase()]}</button>
+              ))}
+            </div>
+            <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+            <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>State</span>
+            <div style={{ display:"flex", gap:4 }}>
+              {["All","Armed","Triggered"].map(s => (
+                <button key={s} onClick={()=>setStateFilter(s)} style={{
+                  padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
+                  border:stateFilter===s?"1.5px solid #6366f1":"1px solid #e5e7eb", background:stateFilter===s?"#eef2ff":"#fff",
+                  color:stateFilter===s?"#6366f1":"#6b7280",
+                }}>{s}</button>
+              ))}
+            </div>
+          </div>
+
+          {/* Table */}
+          <div style={{ margin:"16px 24px 24px", background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"hidden" }}>
+            <div style={{ overflowX:"auto" }}>
+              <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
+                <thead>
+                  <tr>
+                    {SWING_COLS.map(col => (
+                      <TH key={col.k} right={col.r} onClick={()=>toggleSort(col.k)} sorted={sort.k===col.k} dir={sort.dir}>{col.l}</TH>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sortedZones.length === 0 ? (
+                    <tr><td colSpan={SWING_COLS.length} style={{ padding:48, textAlign:"center", color:"#9ca3af", fontSize:13 }}>No zones match your filters.</td></tr>
+                  ) : sortedZones.map(z => {
+                    const { base, quote } = fmtSym(z.symbol);
+                    const long = z.direction === "LONG";
+                    const alert = Math.abs(z.distance_pct) <= SWING_ALERT_BAND_PCT;
+                    return (
+                      <tr key={`${z.symbol}-${z.direction}`}
+                        style={{ borderBottom:"1px solid #f3f4f6", background: alert ? "#fffbeb" : "#fff" }}
+                      >
+                        <td style={{ padding:"11px 14px", fontWeight:700 }}>
+                          <span style={{ color:"#f59e0b" }}>{base}</span>
+                          <span style={{ color:"#9ca3af", fontSize:11 }}>{quote}</span>
+                        </td>
+                        <td style={{ padding:"11px 14px" }}>
+                          <span style={{
+                            display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11,
+                            fontWeight:700, background: long ? "#dcfce7" : "#fee2e2", color: long ? "#15803d" : "#b91c1c",
+                          }}>{SWING_DIRECTION_LABEL[z.direction]}</span>
+                        </td>
+                        <td style={{ padding:"11px 14px" }}>
+                          <span style={{
+                            display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:700,
+                            background: z.state === "TRIGGERED" ? "#e0f2fe" : "#f3f4f6",
+                            color: z.state === "TRIGGERED" ? "#0369a1" : "#6b7280",
+                          }}>{z.state}</span>
+                        </td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{fmtPrice(z.z)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:600 }}>{fmtPrice(z.price)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:700, color: alert ? "#b45309" : "#374151" }}>
+                          {z.distance_pct>=0?"+":""}{z.distance_pct.toFixed(2)}%
+                        </td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#dc2626" }}>{fmtPrice(z.sl)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#16a34a" }}>{fmtPrice(z.tp)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#6b7280" }}>{z.confirm_move_pct.toFixed(2)}%</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#9ca3af" }}>{z.zone_age}d</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.detected_at)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#6b7280" }}>{z.body_ratio.toFixed(2)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.swing_extreme)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
+      )}
     </div>
   );
 }
