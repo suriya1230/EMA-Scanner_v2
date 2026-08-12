@@ -2123,7 +2123,7 @@ const HOME_COLS = [
   {k:"candle_count", l:"Candles",   s:true, r:true},
 ];
 
-function HomePage({ onOpenScanner }) {
+function HomePage({ onOpenScanner, onOpenSwing }) {
   const [summary, setSummary]       = useState(null);
   const [loading, setLoading]       = useState(true);
   const [error, setError]           = useState(null);
@@ -2223,6 +2223,10 @@ function HomePage({ onOpenScanner }) {
             padding:"8px 18px", borderRadius:8, border:"none",
             background:"#6366f1", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer",
           }}>EMA Crossover →</button>
+          <button onClick={onOpenSwing} style={{
+            padding:"8px 18px", borderRadius:8, border:"none",
+            background:"#0891b2", color:"#fff", fontSize:13, fontWeight:700, cursor:"pointer",
+          }}>Swing Strategy →</button>
         </div>
       </div>
 
@@ -2357,6 +2361,38 @@ function HomePage({ onOpenScanner }) {
   );
 }
 
+// ─── Swing Strategy Page (placeholder — logic/conditions added later) ────────
+// Deliberately empty for now: a second screener beside the EMA Crossover
+// page, reached the same way (a button on Home). No fetch, no columns, no
+// logic yet — those get filled in once the swing strategy's actual
+// conditions are defined.
+function SwingStrategyPage({ onHome }) {
+  return (
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"20px 24px 16px", flexWrap:"wrap", gap:12 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+          <button onClick={onHome} style={{
+            display:"flex", alignItems:"center", gap:5, padding:"5px 12px",
+            borderRadius:7, border:"1px solid #e5e7eb", background:"transparent",
+            fontSize:12, fontWeight:600, color:"#374151", cursor:"pointer",
+          }}>← Home</button>
+          <div>
+            <div style={{ fontSize:26, fontWeight:800, letterSpacing:"-0.02em" }}>SWING STRATEGY</div>
+            <div style={{ fontSize:12, color:"#9ca3af", fontWeight:600, marginTop:2, letterSpacing:"0.02em" }}>
+              SCREENER · NOT CONFIGURED YET
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ margin:"0 24px 24px", padding:60, textAlign:"center", color:"#9ca3af", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
+        No swing strategy logic configured yet.
+      </div>
+    </div>
+  );
+}
+
 // ─── App router ───────────────────────────────────────────────────────────────
 export default function App() {
   const [page, setPage]           = useState("home");
@@ -2403,13 +2439,14 @@ export default function App() {
   // reload every single time.
   return (
     <>
-      {page === "home" && <HomePage onOpenScanner={() => setPage("scanner")}/>}
+      {page === "home" && <HomePage onOpenScanner={() => setPage("scanner")} onOpenSwing={() => setPage("swing-strategy")}/>}
       <div style={{ display: page === "scanner" ? "block" : "none" }}>
         <ScannerPage onBacktest={goBacktest} onScreenerBacktest={goScreenerBacktest} onHome={goHome}/>
       </div>
       {page === "backtest" && <BacktestPage scanRow={scanRow} onBack={goBackFromBacktest}/>}
       {page === "details" && <DetailsPage row={detailsRow} market={market} onBack={goBackFromDetails} onBacktest={goBacktest}/>}
       {page === "screener-backtest" && <ScreenerBacktestPage onBack={goBackFromDetails}/>}
+      {page === "swing-strategy" && <SwingStrategyPage onHome={goHome}/>}
     </>
   );
 }
