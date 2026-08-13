@@ -59,6 +59,13 @@ TP_PCT = 0.10                   # target distance from Z
 SL_PCT = 0.05                   # stop distance from Z
 DEFAULT_CONFIRM_FROM = "wick"   # "wick" | "close" — see module docstring
 DEFAULT_MIN_VOLUME_USDT = 5_000_000.0
+# An ARMED zone (confirmed but never retested) more than this many candles
+# (= days, at TIMEFRAME="1d") old expires — keeps the dashboard from
+# showing an unconfirmed setup that's sat untouched for months as if it
+# were still a fresh, actionable watch item. Only affects ARMED zones —
+# an already-TRIGGERED (open) trade has no age cap, and a resolved
+# TP_HIT/SL_HIT is unaffected either way.
+DEFAULT_MAX_ZONE_AGE = 30
 LIVE_STATES = ("ARMED", "TRIGGERED")
 # A 1d candle's own open_time is always UTC midnight regardless of when
 # within that day a moment (confirmation / entry touch / TP-SL resolution)
@@ -285,7 +292,7 @@ async def scan_swing_zones(
     market: str = "futures",
     min_volume_usdt: float = DEFAULT_MIN_VOLUME_USDT,
     confirm_from: str = DEFAULT_CONFIRM_FROM,
-    max_zone_age: int | None = None,
+    max_zone_age: int | None = DEFAULT_MAX_ZONE_AGE,
 ) -> dict:
     """Scans every coin with stored 1d candles, keeps the ones whose latest
     day's approximate USD volume (volume * close — 1d candle volume already
@@ -381,7 +388,7 @@ async def scan_swing_backtest(
     market: str = "futures",
     min_volume_usdt: float = DEFAULT_MIN_VOLUME_USDT,
     confirm_from: str = DEFAULT_CONFIRM_FROM,
-    max_zone_age: int | None = None,
+    max_zone_age: int | None = DEFAULT_MAX_ZONE_AGE,
 ) -> dict:
     """Scans every coin with stored 1d candles (same $-volume filter as
     scan_swing_zones) and returns every historical trade that actually had
