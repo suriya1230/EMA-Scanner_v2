@@ -2415,20 +2415,30 @@ const SWING_STATE_DISPLAY = {
   EXPIRED:   { label: "EXPIRED",   bg: "#f3f4f6", color: "#9ca3af" },
 };
 const SWING_SL_TP_VISIBLE_STATES = ["TRIGGERED", "TP_HIT", "SL_HIT"];
+// Columns follow the 4-point flow in chronological order: 1) anchor
+// (peak/trough) 2) candidate (the swing low/high — Z's own candle)
+// 3) confirmation (the candle whose close ARMS the zone) 4) entry (the
+// candle that touches Z). Each point gets its own time + price pair.
 const SWING_COLS = [
   {k:"symbol",           l:"Symbol"},
   {k:"direction",        l:"Direction"},
   {k:"state",            l:"State"},
-  {k:"z",                l:"Z",              r:true},
-  {k:"price",            l:"Price",          r:true},
-  {k:"distance_pct",     l:"Distance %",     r:true},
-  {k:"sl",               l:"SL",             r:true},
-  {k:"tp",               l:"TP",             r:true},
-  {k:"confirm_move_pct", l:"Confirm Move %", r:true},
-  {k:"zone_age",         l:"Zone Age",       r:true},
-  {k:"detected_at",      l:"Detected Time",  r:true},
-  {k:"body_ratio",       l:"Body Ratio",     r:true},
-  {k:"swing_extreme",    l:"Swing Extreme",  r:true},
+  {k:"anchor_time",      l:"1st Candle Time",  r:true},
+  {k:"anchor_price",     l:"1st Candle Price", r:true},
+  {k:"candidate_time",   l:"Z Candle Time",    r:true},
+  {k:"z",                l:"Z",                r:true},
+  {k:"detected_at",      l:"Confirm Time",     r:true},
+  {k:"confirm_price",    l:"Confirm Price",    r:true},
+  {k:"triggered_at",     l:"Entry Time",       r:true},
+  {k:"entry_price",      l:"Entry Price",      r:true},
+  {k:"price",            l:"Price",            r:true},
+  {k:"distance_pct",     l:"Distance %",       r:true},
+  {k:"sl",               l:"SL",               r:true},
+  {k:"tp",               l:"TP",               r:true},
+  {k:"confirm_move_pct", l:"Confirm Move %",   r:true},
+  {k:"zone_age",         l:"Zone Age",         r:true},
+  {k:"body_ratio",       l:"Body Ratio",       r:true},
+  {k:"swing_extreme",    l:"Swing Extreme",    r:true},
 ];
 
 function SwingStrategyPage({ onHome, onBacktest }) {
@@ -2608,7 +2618,18 @@ function SwingStrategyPage({ onHome, onBacktest }) {
                             </span>
                           </div>
                         </td>
+                        {/* 1st candle — anchor (peak/trough) */}
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.anchor_time)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.anchor_price)}</td>
+                        {/* Z candle — the swing low/high itself */}
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.candidate_time)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{fmtPrice(z.z)}</td>
+                        {/* Confirming candle */}
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.detected_at)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.confirm_price)}</td>
+                        {/* Entry candle */}
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.triggered_at)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{z.triggered_at ? fmtPrice(z.entry_price) : "—"}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:600 }}>{fmtPrice(z.price)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:700, color: alert ? "#b45309" : "#374151" }}>
                           {z.distance_pct>=0?"+":""}{z.distance_pct.toFixed(2)}%
@@ -2617,7 +2638,6 @@ function SwingStrategyPage({ onHome, onBacktest }) {
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#16a34a" }}>{SWING_SL_TP_VISIBLE_STATES.includes(z.state) ? fmtPrice(z.tp) : "—"}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#6b7280" }}>{z.confirm_move_pct.toFixed(2)}%</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", color:"#9ca3af" }}>{fmtZoneAge(z.detected_at)}</td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.detected_at)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#6b7280" }}>{z.body_ratio.toFixed(2)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.swing_extreme)}</td>
                       </tr>

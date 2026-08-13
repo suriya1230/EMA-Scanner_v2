@@ -23,8 +23,8 @@ BOTH of the following legs, each >= SWING_THRESHOLD, before it arms a zone:
        L.close), L is CONFIRMED. Unlike the down-leg above, an intrabar
        spike doesn't count here — the reversal must actually hold through
        the candle's close, not just wick past the threshold.
-    4. Zone level Z = L.close (the candle's close, not its low/open —
-       candle colour is irrelevant), projected forward and ARMED.
+    4. Zone level Z = L.low (the candle's own extreme, the same value as
+       "swing_extreme" below — not its close), projected forward and ARMED.
     5. Entry: price trades back down and touches Z (intrabar low <= Z).
     6. Stop: Z * (1 - SL_PCT). Target: Z * (1 + TP_PCT).
     7. Invalidation: a candle CLOSES at or beyond the stop level (a close-
@@ -79,11 +79,19 @@ REFINE_CASCADE_INTERVALS = ["5m", "15m", "30m", "1h"]
 DAY_MS = 86_400_000
 
 
-def _make_zone(extreme: dict, pivot_type: str, move_pct: float, idx: int) -> dict:
-    z = extreme["close"]
+def _make_zone(
+    anchor: dict, anchor_idx: int, extreme: dict, extreme_idx: int,
+    pivot_type: str, move_pct: float, idx: int, confirm_price: float,
+) -> dict:
+    is_long = pivot_type == "low"
+    # Zone level Z = the candidate candle's own extreme (its low for a BUY
+    # zone, its high for a SELL zone) — not its close. This is the same
+    # value as "swing_extreme" below; the two fields are kept separate in
+    # the output because "swing_extreme" is documented/displayed as a
+    # distinct reference column, even though they're now numerically equal.
+    z = extreme["low"] if is_long else extreme["high"]
     rng = extreme["high"] - extreme["low"]
     body_ratio = abs(extreme["close"] - extreme["open"]) / rng if rng else 0.0
-    is_long = pivot_type == "low"
     return {
         "z": z,
         "state": "ARMED",
@@ -91,9 +99,13 @@ def _make_zone(extreme: dict, pivot_type: str, move_pct: float, idx: int) -> dic
         "tp": z * (1 + TP_PCT) if is_long else z * (1 - TP_PCT),
         "swing_extreme": extreme["low"] if is_long else extreme["high"],
         "confirm_move_pct": move_pct,
+        "confirm_price": confirm_price,  # the confirming candle's own close
         "body_ratio": body_ratio,
-        "confirmed_at": idx,
-        "triggered_at": None,
+        "anchor_at": anchor_idx,          # candle index of the peak/trough (diagram point 1)
+        "anchor_price": anchor["high"] if is_long else anchor["low"],
+        "candidate_at": extreme_idx,      # candle index of the swing low/high itself (diagram point 2)
+        "confirmed_at": idx,              # candle index of the confirming candle (diagram point 3)
+        "triggered_at": None,             # candle index of the entry touch (diagram point 4)
         "resolved_at": None,  # candle index where TP_HIT/SL_HIT/EXPIRED happened
     }
 
@@ -112,7 +124,9 @@ def _run_side_history(
     module docstring for the two-leg (down-leg then up-leg, or the mirror)
     rule."""
     anchor: dict | None = None      # the opposing extreme the current leg is measured from
+    anchor_idx: int | None = None
     candidate: dict | None = None   # the running extreme (trough for long, peak for short)
+    candidate_idx: int | None = None
     primed = False                  # has the leg INTO candidate already reached SWING_THRESHOLD?
     zone: dict | None = None
     history: list[dict] = []
@@ -170,7 +184,7 @@ def _run_side_history(
             c["high"] > anchor["high"] if side == "long" else c["low"] < anchor["low"]
         )
         if is_new_anchor:
-            anchor, candidate, primed = c, None, False
+            anchor, anchor_idx, candidate, candidate_idx, primed = c, idx, None, None, False
             continue
 
         # 3. Track the candidate extreme (trough for long, peak for short)
@@ -183,7 +197,7 @@ def _run_side_history(
             c["low"] < candidate["low"] if side == "long" else c["high"] > candidate["high"]
         )
         if is_new_candidate:
-            candidate = c
+            candidate, candidate_idx = c, idx
             anchor_ref = anchor["high" if side == "long" else "low"] if confirm_from == "wick" else anchor["close"]
             leg_pct = (
                 (anchor_ref - c["low"]) / anchor_ref if side == "long"
@@ -209,9 +223,13 @@ def _run_side_history(
                 else (cand_ref - c["close"]) / cand_ref
             ) if cand_ref else 0.0
             if cand_ref and move_pct >= SWING_THRESHOLD:
-                zone = _make_zone(candidate, "low" if side == "long" else "high", move_pct, idx)
+                zone = _make_zone(
+                    anchor, anchor_idx, candidate, candidate_idx,
+                    "low" if side == "long" else "high", move_pct, idx, c["close"],
+                )
                 history.append(zone)
-                anchor, candidate, primed = None, None, False  # restart the search for this side's next swing point
+                # restart the search for this side's next swing point
+                anchor, anchor_idx, candidate, candidate_idx, primed = None, None, None, None, False
 
     return history
 
@@ -275,6 +293,21 @@ def _touch_predicate(z: float, side: str):
     if side == "long":
         return lambda row: row["low"] <= z
     return lambda row: row["high"] >= z
+
+
+async def _refine_extreme_moment(
+    db: AsyncSession, symbol: str, market: str, day_open_time: int, seeking_high: bool,
+) -> int:
+    """Pinpoints WHEN during a day its own extreme (the peak/trough anchor,
+    or the swing low/high candidate) was actually printed — using whichever
+    finer interval tier is available, picking the row with the max high
+    (seeking_high=True) or min low (seeking_high=False). Falls back to the
+    day's own open_time if no finer data covers it."""
+    rows = await _fetch_finest_available_rows(db, symbol, market, day_open_time)
+    if not rows:
+        return day_open_time
+    best = max(rows, key=lambda r: r["high"]) if seeking_high else min(rows, key=lambda r: r["low"])
+    return best["open_time"]
 
 
 def _resolution_predicate(sl: float, tp: float, side: str, outcome: str):
@@ -350,10 +383,28 @@ async def scan_swing_zones(
                 )
             elif zone["resolved_at"] is not None:
                 resolved_at = candles[zone["resolved_at"]]["open_time"]  # EXPIRED — no finer condition to refine against
+
+            # Anchor (diagram point 1, the peak/trough) and candidate
+            # (point 2, the swing low/high itself) both sit on already-
+            # elapsed days relative to confirmation, so no look-ahead-bias
+            # concern refining either — unlike detected_at above, these
+            # always refine. seeking_high flips between the two: for LONG,
+            # the anchor is a peak (seeking its high) and the candidate is
+            # a trough (seeking its low); for SHORT it's the reverse.
+            anchor_day = candles[zone["anchor_at"]]["open_time"]
+            anchor_time = await _refine_extreme_moment(db, symbol, market, anchor_day, seeking_high=(side == "long"))
+            candidate_day = candles[zone["candidate_at"]]["open_time"]
+            candidate_time = await _refine_extreme_moment(db, symbol, market, candidate_day, seeking_high=(side == "short"))
+
             rows.append({
                 "symbol": symbol,
                 "direction": "LONG" if side == "long" else "SHORT",
                 "state": zone["state"],
+                "anchor_time": anchor_time,      # diagram point 1 — peak/trough
+                "anchor_price": zone["anchor_price"],
+                "candidate_time": candidate_time,  # diagram point 2 — the swing low/high (Z's candle)
+                "confirm_price": zone["confirm_price"],  # diagram point 3's close (the confirming candle)
+                "entry_price": zone["z"],          # diagram point 4 — always exactly Z
                 "z": zone["z"],
                 "price": price,
                 "distance_pct": (price - zone["z"]) / zone["z"] * 100,
