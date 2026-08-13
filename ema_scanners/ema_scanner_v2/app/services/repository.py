@@ -187,20 +187,21 @@ class CandleRepository:
         start_time: int,
         end_time: int,
     ) -> list[dict]:
-        """High/low for symbol+market+interval within [start_time, end_time),
-        ascending by open_time — used by the Swing Strategy screener to
-        pinpoint a more precise intraday timestamp than a coarser
-        timeframe's candle boundary alone provides (e.g. narrowing a 1d
-        candle's "which day" down to "which hour" using stored 1h data)."""
+        """High/low/close for symbol+market+interval within [start_time,
+        end_time), ascending by open_time — used by the Swing Strategy
+        screener to pinpoint a more precise intraday timestamp than a
+        coarser timeframe's candle boundary alone provides (e.g. narrowing
+        a 1d candle's "which day" down to "which minute/hour" using stored
+        finer-interval data)."""
         result = await session.execute(
-            select(Candle.open_time, Candle.high, Candle.low)
+            select(Candle.open_time, Candle.high, Candle.low, Candle.close)
             .where(
                 Candle.symbol == symbol, Candle.market == market, Candle.interval == interval,
                 Candle.open_time >= start_time, Candle.open_time < end_time,
             )
             .order_by(Candle.open_time.asc())
         )
-        return [{"open_time": ot, "high": h, "low": l} for ot, h, l in result.all()]
+        return [{"open_time": ot, "high": h, "low": l, "close": c} for ot, h, l, c in result.all()]
 
     @staticmethod
     async def prune_old_candles(

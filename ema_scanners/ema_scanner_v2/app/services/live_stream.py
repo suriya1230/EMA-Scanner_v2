@@ -19,12 +19,25 @@ trading, so ticks are buffered in memory and flushed to Postgres on a fixed
 interval rather than one DB write per tick. That keeps "live" meaning
 sub-second-to-a-couple-seconds latency without turning hundreds of symbols'
 trade activity directly into hundreds of individual writes per second.
+
+A WebSocket connection can go quiet without ever raising an error — Binance
+(or a network path in between) can stop actually delivering messages while
+the TCP socket stays technically open, so the normal reconnect-on-exception
+logic below never notices anything is wrong. A separate watchdog task (see
+start_watchdog/_watchdog_loop) checks every WATCHDOG_INTERVAL_SECONDS
+whether each connection has received a message recently; if one's gone
+silent for longer than STALE_THRESHOLD_SECONDS, it force-restarts every
+connection. This is a status check (a timestamp comparison), not a Binance
+API call, so running it every 30 seconds costs nothing against rate limits
+— unlike trying to re-poll every (symbol, interval) pair on a timer, which
+would need far more request weight per minute than Binance allows.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import time
 
 import websockets
 
@@ -39,10 +52,15 @@ STREAM_BASE = "wss://fstream.binance.com/stream"
 STREAMS_PER_CONNECTION = 190  # stays under Binance's ~200-stream-per-connection cap
 FLUSH_INTERVAL_SECONDS = 1.0
 RECONNECT_BACKOFF = [1, 2, 5, 10, 30]  # seconds; holds at the last value once exhausted
+WATCHDOG_INTERVAL_SECONDS = 30
+STALE_THRESHOLD_SECONDS = 120  # no message from a connection this long -> treat it as dead
 
 _tasks: list[asyncio.Task] = []
 _pending: dict[tuple[str, str, str, int], dict] = {}
 _stop_event = asyncio.Event()
+_last_message_at: dict[int, float] = {}   # conn_id -> time.time() of its most recent message
+_watchdog_task: asyncio.Task | None = None
+_watchdog_stop_event = asyncio.Event()    # separate from _stop_event — must survive restart_live_stream()
 
 
 def _chunk(items: list[str], size: int) -> list[list[str]]:
@@ -101,9 +119,11 @@ async def _handle_connection(stream_names: list[str], conn_id: int) -> None:
             async with websockets.connect(url, ping_interval=180, ping_timeout=60) as ws:
                 logger.info("Live stream conn #%d: connected (%d streams).", conn_id, len(stream_names))
                 backoff_idx = 0
+                _last_message_at[conn_id] = time.time()
                 async for raw in ws:
                     if _stop_event.is_set():
                         break
+                    _last_message_at[conn_id] = time.time()
                     _handle_message(raw)
         except asyncio.CancelledError:
             raise
@@ -130,6 +150,7 @@ async def start_live_stream() -> None:
         return
 
     _stop_event.clear()
+    _last_message_at.clear()  # stale conn_ids from a previous run shouldn't confuse the watchdog
     stream_names = sorted(
         f"{symbol.lower()}@kline_{interval}"
         for symbol in symbols
@@ -169,8 +190,54 @@ def is_running() -> bool:
 
 
 def status() -> dict:
+    now = time.time()
+    silent_for = {cid: round(now - ts) for cid, ts in _last_message_at.items()}
     return {
         "running": is_running(),
         "connections": max(len(_tasks) - 1, 0),  # excludes the flush-loop task
         "intervals": UNIVERSE_INTERVALS,
+        "seconds_since_last_message": silent_for,
+        "watchdog_running": _watchdog_task is not None and not _watchdog_task.done(),
     }
+
+
+async def _watchdog_loop() -> None:
+    """Runs for the lifetime of the app (independent of start/stop/restart
+    cycles on the connections themselves) and checks every
+    WATCHDOG_INTERVAL_SECONDS whether any connection has gone quiet for
+    longer than STALE_THRESHOLD_SECONDS — a live, correctly-flowing
+    connection should receive kline updates continuously (Binance pushes
+    them roughly every 1-2s per open kline stream), so a multi-minute
+    silence means the connection died without raising an exception."""
+    while not _watchdog_stop_event.is_set():
+        await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+        if _watchdog_stop_event.is_set() or not _last_message_at:
+            continue
+        now = time.time()
+        stale = [cid for cid, ts in _last_message_at.items() if now - ts > STALE_THRESHOLD_SECONDS]
+        if stale:
+            logger.warning(
+                "Live stream watchdog: connection(s) %s silent for over %ds — forcing a full restart.",
+                stale, STALE_THRESHOLD_SECONDS,
+            )
+            await restart_live_stream()
+
+
+def start_watchdog() -> None:
+    global _watchdog_task
+    _watchdog_stop_event.clear()
+    if _watchdog_task is None or _watchdog_task.done():
+        _watchdog_task = asyncio.create_task(_watchdog_loop())
+        logger.info("Live stream watchdog: started (checks every %ds).", WATCHDOG_INTERVAL_SECONDS)
+
+
+async def stop_watchdog() -> None:
+    global _watchdog_task
+    _watchdog_stop_event.set()
+    if _watchdog_task is not None:
+        _watchdog_task.cancel()
+        try:
+            await _watchdog_task
+        except asyncio.CancelledError:
+            pass
+        _watchdog_task = None

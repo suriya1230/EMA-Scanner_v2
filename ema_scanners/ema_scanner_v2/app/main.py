@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse
 
 from app.core.config import settings
 from app.db.database import init_db
-from app.services.live_stream import start_live_stream, stop_live_stream
+from app.services.live_stream import start_live_stream, start_watchdog, stop_live_stream, stop_watchdog
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -58,12 +58,14 @@ async def lifespan(app: FastAPI):
     logger.info("Database tables created/verified.")
 
     await start_live_stream()
+    start_watchdog()
 
     logger.info("EMA Scanner is ready. 🚀")
 
     yield  # ── App is running ──
 
     logger.info("Shutting down...")
+    await stop_watchdog()
     await stop_live_stream()
 
 

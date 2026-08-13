@@ -40,6 +40,37 @@ function fmtTime(dt) {
 function fmtSym(sym) {
   return { base: sym.replace("USDT",""), quote: "/USDT" };
 }
+// Time-only (no date) — for spots like the Swing Strategy State cell where
+// the date is already shown elsewhere on the row and just adds clutter.
+function fmtTimeOnly(dt) {
+  if (!dt) return "—";
+  const d = new Date(dt);
+  return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true }) + " IST";
+}
+// Elapsed wall-clock time since a zone's detected_at — the backend's own
+// zone_age counts whole 1d candles, which rounds anything confirmed within
+// the last ~24h down to "0d" and hides how fresh it actually is.
+function fmtZoneAge(detectedAtMs) {
+  if (!detectedAtMs) return "—";
+  const totalMinutes = Math.max(0, Math.floor((Date.now() - detectedAtMs) / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+// Fixed-duration formatter (given an explicit ms span, not "elapsed from
+// now") — used for the Swing Backtest's entry->exit trade duration.
+function fmtDuration(ms) {
+  if (ms == null) return "—";
+  const totalMinutes = Math.max(0, Math.floor(ms / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  if (days > 0) return `${days}d ${hours}h`;
+  return `${hours}h ${minutes}m`;
+}
 
 // ─── Shared components ───────────────────────────────────────────────────────
 const TH = ({ children, right, onClick, sorted, dir }) => (
@@ -2369,8 +2400,21 @@ function HomePage({ onOpenScanner, onOpenSwing }) {
 // 5% stop / 10% target). Purely a read: all detection runs server-side.
 const SWING_ALERT_BAND_PCT = 2; // rows within this distance to Z are the actionable watchlist
 // Backend direction values stay LONG/SHORT (matches the strategy spec's own
-// terminology) — displayed as BUY/SELL to match this app's SigBadge convention.
-const SWING_DIRECTION_LABEL = { LONG: "BUY", SHORT: "SELL" };
+// terminology) — displayed as BULLISH/BEARISH.
+const SWING_DIRECTION_LABEL = { LONG: "BULLISH", SHORT: "BEARISH" };
+// The live dashboard now keeps showing a side's last zone even after it
+// resolves (TP_HIT/SL_HIT), so a coin's most recent outcome stays visible
+// instead of vanishing the moment it closes — displayed here as a single
+// "COMPLETED" badge, colored by win/loss rather than exposing the raw
+// TP_HIT/SL_HIT state names.
+const SWING_STATE_DISPLAY = {
+  ARMED:     { label: "ARMED",     bg: "#f3f4f6", color: "#6b7280" },
+  TRIGGERED: { label: "TRIGGERED", bg: "#e0f2fe", color: "#0369a1" },
+  TP_HIT:    { label: "COMPLETED", bg: "#dcfce7", color: "#15803d" },
+  SL_HIT:    { label: "COMPLETED", bg: "#fee2e2", color: "#b91c1c" },
+  EXPIRED:   { label: "EXPIRED",   bg: "#f3f4f6", color: "#9ca3af" },
+};
+const SWING_SL_TP_VISIBLE_STATES = ["TRIGGERED", "TP_HIT", "SL_HIT"];
 const SWING_COLS = [
   {k:"symbol",           l:"Symbol"},
   {k:"direction",        l:"Direction"},
@@ -2387,13 +2431,13 @@ const SWING_COLS = [
   {k:"swing_extreme",    l:"Swing Extreme",  r:true},
 ];
 
-function SwingStrategyPage({ onHome }) {
+function SwingStrategyPage({ onHome, onBacktest }) {
   const [data, setData]                 = useState(null);
   const [loading, setLoading]           = useState(true);
   const [error, setError]               = useState(null);
   const [directionFilter, setDirectionFilter] = useState("All");
   const [stateFilter, setStateFilter]   = useState("All");
-  const [sort, setSort]                 = useState({ k:"distance_pct", dir:"asc" });
+  const [sort, setSort]                 = useState({ k:"detected_at", dir:"desc" });
 
   // `silent` skips the loading flag so background polls don't blank the
   // table out every few seconds — only the very first load (and a manual
@@ -2426,7 +2470,8 @@ function SwingStrategyPage({ onHome }) {
 
   const filteredZones = useMemo(() => zones.filter(z => {
     if (directionFilter !== "All" && z.direction !== directionFilter.toUpperCase()) return false;
-    if (stateFilter !== "All" && z.state !== stateFilter.toUpperCase()) return false;
+    if (stateFilter === "Completed" && !["TP_HIT","SL_HIT"].includes(z.state)) return false;
+    if (stateFilter !== "All" && stateFilter !== "Completed" && z.state !== stateFilter.toUpperCase()) return false;
     return true;
   }), [zones, directionFilter, stateFilter]);
 
@@ -2479,7 +2524,7 @@ function SwingStrategyPage({ onHome }) {
       ) : (
         <>
           <div style={{ padding:"0 24px 12px", fontSize:12, color:"#9ca3af" }}>
-            <strong style={{ color:"#374151" }}>{sortedZones.length}</strong> live zone(s) across{" "}
+            <strong style={{ color:"#374151" }}>{sortedZones.length}</strong> zone(s) across{" "}
             <strong style={{ color:"#374151" }}>{data.symbols_scanned}</strong> coin(s) ≥ ${(data.min_volume_usdt/1e6).toFixed(0)}M volume
           </div>
 
@@ -2498,7 +2543,7 @@ function SwingStrategyPage({ onHome }) {
             <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
             <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>State</span>
             <div style={{ display:"flex", gap:4 }}>
-              {["All","Armed","Triggered"].map(s => (
+              {["All","Armed","Triggered","Completed"].map(s => (
                 <button key={s} onClick={()=>setStateFilter(s)} style={{
                   padding:"5px 13px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer",
                   border:stateFilter===s?"1.5px solid #6366f1":"1px solid #e5e7eb", background:stateFilter===s?"#eef2ff":"#fff",
@@ -2506,6 +2551,10 @@ function SwingStrategyPage({ onHome }) {
                 }}>{s}</button>
               ))}
             </div>
+            <button onClick={onBacktest} style={{
+              marginLeft:"auto", padding:"6px 16px", borderRadius:8, border:"1px solid #6366f1",
+              background:"transparent", color:"#6366f1", fontSize:12, fontWeight:700, cursor:"pointer", whiteSpace:"nowrap",
+            }}>Backtest Summary</button>
           </div>
 
           {/* Table */}
@@ -2541,21 +2590,33 @@ function SwingStrategyPage({ onHome }) {
                           }}>{SWING_DIRECTION_LABEL[z.direction]}</span>
                         </td>
                         <td style={{ padding:"11px 14px" }}>
-                          <span style={{
-                            display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:700,
-                            background: z.state === "TRIGGERED" ? "#e0f2fe" : "#f3f4f6",
-                            color: z.state === "TRIGGERED" ? "#0369a1" : "#6b7280",
-                          }}>{z.state}</span>
+                          <div style={{ display:"flex", flexDirection:"column", gap:3, alignItems:"flex-start" }}>
+                            <span style={{
+                              display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:700,
+                              background: (SWING_STATE_DISPLAY[z.state] || SWING_STATE_DISPLAY.ARMED).bg,
+                              color: (SWING_STATE_DISPLAY[z.state] || SWING_STATE_DISPLAY.ARMED).color,
+                            }}>{(SWING_STATE_DISPLAY[z.state] || SWING_STATE_DISPLAY.ARMED).label}</span>
+                            <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>
+                              {/* Timestamp matches whichever state is currently shown — when it
+                                  got ARMED, or when it TRIGGERED, or when it COMPLETED — not
+                                  always the original confirmation time. */}
+                              {fmtTimeOnly(
+                                z.state === "ARMED" ? z.detected_at
+                                : z.state === "TRIGGERED" ? z.triggered_at
+                                : z.resolved_at
+                              )}
+                            </span>
+                          </div>
                         </td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{fmtPrice(z.z)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:600 }}>{fmtPrice(z.price)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:700, color: alert ? "#b45309" : "#374151" }}>
                           {z.distance_pct>=0?"+":""}{z.distance_pct.toFixed(2)}%
                         </td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#dc2626" }}>{fmtPrice(z.sl)}</td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#16a34a" }}>{fmtPrice(z.tp)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#dc2626" }}>{SWING_SL_TP_VISIBLE_STATES.includes(z.state) ? fmtPrice(z.sl) : "—"}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#16a34a" }}>{SWING_SL_TP_VISIBLE_STATES.includes(z.state) ? fmtPrice(z.tp) : "—"}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#6b7280" }}>{z.confirm_move_pct.toFixed(2)}%</td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#9ca3af" }}>{z.zone_age}d</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#9ca3af" }}>{fmtZoneAge(z.detected_at)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.detected_at)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#6b7280" }}>{z.body_ratio.toFixed(2)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.swing_extreme)}</td>
@@ -2568,6 +2629,329 @@ function SwingStrategyPage({ onHome }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+// ─── Swing Backtest Summary Page ──────────────────────────────────────────────
+// Reads GET /api/swing-backtest — every historical trade (a zone that
+// actually got entered) across all qualifying coins, resolved as WIN/LOSS
+// or still OPEN. Unlike the EMA backtest, entry is always exactly Z and
+// exit is always exactly TP or SL (this strategy has no slippage/partial-
+// fill concept), so every WIN is +10% and every LOSS is -5% — the
+// aggregation here is purely about which/how-many trades fall in the
+// selected period, not simulating fill prices client-side.
+const SWING_BT_PERIOD_LABELS = [["day","Day"],["week","Week"],["month","Month"]];
+const SWING_BT_PERIOD_DAYS = { day: 1, week: 7, month: 30 };
+const SWING_BT_COLS = [
+  {k:"symbol",      l:"Symbol"},
+  {k:"direction",   l:"Direction"},
+  {k:"entry_time",  l:"Entry Time"},
+  {k:"entry_price", l:"Entry Price", r:true},
+  {k:"sl",          l:"Stop Loss",   r:true},
+  {k:"tp",          l:"Take Profit", r:true},
+  {k:"exit_time",   l:"Exit Time"},
+  {k:"exit_price",  l:"Exit Price",  r:true},
+  {k:"duration_ms", l:"Duration",    r:true},
+  {k:"gain_pct",    l:"PnL %",       r:true},
+  {k:"gain_dollar", l:"PnL ($)",     r:true},
+  {k:"result",      l:"Result"},
+];
+
+function SwingBacktestPage({ onBack }) {
+  const [btPeriod, setBtPeriod]       = useState("day");
+  const [customStart, setCustomStart] = useState("");
+  const [customEnd, setCustomEnd]     = useState("");
+  const [capital, setCapital]         = useState(1000);
+  const [directionFilter, setDirectionFilter] = useState("All");
+  const [loading, setLoading]         = useState(true);
+  const [error, setError]             = useState(null);
+  const [allTrades, setAllTrades]     = useState([]);
+  const [sort, setSort]               = useState({ k:"entry_time", dir:"desc" });
+  const [exporting, setExporting]     = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/swing-backtest`);
+      if (!res.ok) throw new Error(`API ${res.status}`);
+      const json = await res.json();
+      setAllTrades(json.trades || []);
+    } catch (e) {
+      setError(e.message);
+      setAllTrades([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Window range — same convention as the EMA Backtest Summary page: "Day"
+  // means the actual IST calendar day, not a rolling 24h window, and a
+  // custom start/end always takes priority once both are picked.
+  const { rangeStartMs, rangeEndMs } = useMemo(() => {
+    if (customStart && customEnd) {
+      return {
+        rangeStartMs: new Date(`${customStart}T00:00:00`).getTime(),
+        rangeEndMs: new Date(`${customEnd}T23:59:59.999`).getTime(),
+      };
+    }
+    if (btPeriod === "day") {
+      const IST_OFFSET_MS = 5.5 * 3_600_000;
+      const nowIst = Date.now() + IST_OFFSET_MS;
+      const todayIstMidnightIst = Math.floor(nowIst / 86_400_000) * 86_400_000;
+      return { rangeStartMs: todayIstMidnightIst - IST_OFFSET_MS, rangeEndMs: Date.now() };
+    }
+    return { rangeStartMs: Date.now() - SWING_BT_PERIOD_DAYS[btPeriod] * 86_400_000, rangeEndMs: Date.now() };
+  }, [btPeriod, customStart, customEnd]);
+
+  const windowTrades = useMemo(
+    () => allTrades.filter(t => t.entry_time >= rangeStartMs && t.entry_time <= rangeEndMs),
+    [allTrades, rangeStartMs, rangeEndMs]
+  );
+
+  const filteredTrades = useMemo(() => (
+    directionFilter === "All" ? windowTrades : windowTrades.filter(t => t.direction === directionFilter.toUpperCase())
+  ), [windowTrades, directionFilter]);
+
+  // Capital-based $ PnL — trades are otherwise fixed-percentage (+TP_PCT or
+  // -SL_PCT), so this is the only place "capital" actually matters.
+  const withDollar = useMemo(() => filteredTrades.map(t => ({
+    ...t, gain_dollar: t.gain_pct != null ? (capital * t.gain_pct) / 100 : null,
+  })), [filteredTrades, capital]);
+
+  const toggleSort = k => setSort(s => s.k===k ? {k, dir:s.dir==="asc"?"desc":"asc"} : {k, dir:"desc"});
+  const sortedTrades = useMemo(() => [...withDollar].sort((a, b) => {
+    const dir = sort.dir === "asc" ? 1 : -1;
+    const av = a[sort.k], bv = b[sort.k];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1; if (bv == null) return -1;
+    return typeof av === "string" ? dir*av.localeCompare(bv) : dir*(av-bv);
+  }), [withDollar, sort]);
+
+  const stats = useMemo(() => {
+    const won = filteredTrades.filter(t => t.result === "WIN").length;
+    const lost = filteredTrades.filter(t => t.result === "LOSS").length;
+    const closed = won + lost;
+    const pnlDollar = withDollar.reduce((sum, t) => sum + (t.gain_dollar || 0), 0);
+    const winRate = closed > 0 ? (won / closed) * 100 : null;
+    return { won, lost, pnlDollar, winRate, total: filteredTrades.length };
+  }, [filteredTrades, withDollar]);
+
+  const exportCsv = useCallback(() => {
+    setExporting(true);
+    try {
+      const header = ["Symbol","Direction","Entry Time","Entry Price","Stop Loss","Take Profit","Exit Time","Exit Price","Duration","PnL %","PnL ($)","Result"];
+      const csvEscape = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
+      const lines = [header.join(",")];
+      for (const t of sortedTrades) {
+        const open = t.result === "OPEN";
+        lines.push([
+          t.symbol, SWING_DIRECTION_LABEL[t.direction], fmtDateTime(t.entry_time), t.entry_price, t.sl, t.tp,
+          open ? "Still running" : fmtDateTime(t.exit_time), open ? "" : t.exit_price,
+          fmtDuration(t.duration_ms), open ? "" : t.gain_pct.toFixed(2), open ? "" : t.gain_dollar.toFixed(2),
+          t.result,
+        ].map(csvEscape).join(","));
+      }
+      const blob = new Blob(["﻿" + lines.join("\n")], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `swing_backtest_${btPeriod}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } finally {
+      setExporting(false);
+    }
+  }, [sortedTrades, btPeriod]);
+
+  return (
+    <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"13px 24px", borderBottom:"1px solid #e8eaed", flexWrap:"wrap" }}>
+        <button onClick={onBack} style={{
+          display:"flex", alignItems:"center", gap:5, padding:"5px 12px",
+          borderRadius:7, border:"1px solid #e5e7eb", background:"transparent",
+          fontSize:12, fontWeight:600, color:"#374151", cursor:"pointer",
+        }}>← Back</button>
+        <span style={{ color:"#d1d5db", fontSize:14 }}>›</span>
+        <span style={{ fontWeight:800, fontSize:17 }}>Swing Backtest Summary</span>
+        <span style={{ color:"#9ca3af", fontSize:12 }}>All qualifying coins · Swing Zone Retest</span>
+        <button onClick={exportCsv} disabled={exporting || loading || sortedTrades.length === 0} style={{
+          marginLeft:"auto", display:"flex", alignItems:"center", gap:6,
+          padding:"7px 16px", borderRadius:8, border:"none",
+          background:"#111827", color:"#fff", fontSize:12, fontWeight:700,
+          cursor: (exporting || loading || sortedTrades.length === 0) ? "not-allowed" : "pointer",
+          opacity: (exporting || loading || sortedTrades.length === 0) ? 0.6 : 1,
+        }}>{exporting ? "Exporting…" : "⭳ Export"}</button>
+      </div>
+
+      {/* Controls */}
+      <div style={{ padding:"20px 24px" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:16, flexWrap:"wrap" }}>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Period</span>
+          <div style={{ display:"flex", gap:4 }}>
+            {SWING_BT_PERIOD_LABELS.map(([k,l]) => (
+              <button key={k} disabled={loading} onClick={()=>{ setBtPeriod(k); setCustomStart(""); setCustomEnd(""); }} style={{
+                padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700,
+                cursor: loading ? "not-allowed" : "pointer",
+                border: (btPeriod===k && !customStart && !customEnd) ? "1px solid #111827" : "1px solid #e5e7eb",
+                background: (btPeriod===k && !customStart && !customEnd) ? "#111827" : "#fff",
+                color: (btPeriod===k && !customStart && !customEnd) ? "#fff" : "#6b7280",
+              }}>{l}</button>
+            ))}
+          </div>
+          <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+            <input
+              type="date" disabled={loading} value={customStart} max={customEnd || undefined}
+              onChange={e => setCustomStart(e.target.value)}
+              style={{ padding:"4px 8px", borderRadius:6, border:"1px solid #e5e7eb", fontSize:12, color:"#374151" }}
+            />
+            <span style={{ color:"#9ca3af", fontSize:12 }}>to</span>
+            <input
+              type="date" disabled={loading} value={customEnd} min={customStart || undefined}
+              onChange={e => setCustomEnd(e.target.value)}
+              style={{ padding:"4px 8px", borderRadius:6, border:"1px solid #e5e7eb", fontSize:12, color:"#374151" }}
+            />
+          </div>
+          <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Direction</span>
+          <div style={{ display:"flex", gap:4 }}>
+            {["All","Long","Short"].map(d => (
+              <button key={d} onClick={()=>setDirectionFilter(d)} style={{
+                padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700, cursor:"pointer",
+                border: directionFilter===d ? "1.5px solid #6366f1" : "1px solid #e5e7eb",
+                background: directionFilter===d ? "#eef2ff" : "#fff",
+                color: directionFilter===d ? "#6366f1" : "#6b7280",
+              }}>{d === "All" ? "All" : SWING_DIRECTION_LABEL[d.toUpperCase()]}</button>
+            ))}
+          </div>
+          <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Capital</span>
+          <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+            <span style={{ color:"#9ca3af", fontSize:12 }}>$</span>
+            <input
+              type="number" min="1" step="100" defaultValue={capital}
+              onBlur={e => { const v = parseFloat(e.target.value); if (v > 0) setCapital(v); }}
+              onKeyDown={e => { if (e.key === "Enter") e.target.blur(); }}
+              style={{ width:80, padding:"4px 6px", borderRadius:6, border:"1px solid #e5e7eb", fontSize:12 }}
+            />
+          </div>
+          {loading && <span style={{ fontSize:11, color:"#9ca3af" }}>Loading…</span>}
+        </div>
+
+        {error ? (
+          <div style={{ padding:48, textAlign:"center", color:"#dc2626", fontSize:14, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
+            <div style={{ fontSize:22, marginBottom:8 }}>⚠</div>
+            Could not load swing backtest: <code style={{ fontSize:12 }}>{error}</code>
+          </div>
+        ) : (
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit,minmax(220px,1fr))", gap:16 }}>
+            <SummaryCard
+              label="Won" badge="WIN" badgeBg="#bbf1d3" badgeColor="#166534"
+              value={stats.won} valueColor="#16a34a" bg="#e7f8ef" Icon={CheckCircle2}
+            />
+            <SummaryCard
+              label="Loss" badge="LOSS" badgeBg="#fbcfd1" badgeColor="#991b1b"
+              value={stats.lost} valueColor="#dc2626" bg="#fdecec" Icon={XCircle}
+            />
+            <SummaryCard
+              label="PnL ($)" badge={stats.pnlDollar >= 0 ? "PROFIT" : "LOSS"}
+              badgeBg={stats.pnlDollar >= 0 ? "#bfe3fb" : "#fbcfd1"}
+              badgeColor={stats.pnlDollar >= 0 ? "#075985" : "#991b1b"}
+              value={`${stats.pnlDollar >= 0 ? "+" : ""}$${stats.pnlDollar.toFixed(2)}`}
+              valueColor={stats.pnlDollar >= 0 ? "#0891b2" : "#dc2626"} bg="#e6f6fd" Icon={DollarSign}
+            />
+            <SummaryCard
+              label="Win Rate" badge={stats.winRate >= 50 ? "GOOD" : "LOW"}
+              badgeBg={stats.winRate >= 50 ? "#bbf1d3" : "#fbcfd1"}
+              badgeColor={stats.winRate >= 50 ? "#166534" : "#991b1b"}
+              value={stats.winRate != null ? `${stats.winRate.toFixed(1)}%` : "—"}
+              valueColor={stats.winRate >= 50 ? "#16a34a" : "#dc2626"} bg="#fdf1e2" Icon={Award}
+            />
+          </div>
+        )}
+
+        {/* Trades table */}
+        {!error && (
+          <div style={{ marginTop:20, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb", overflow:"hidden" }}>
+            <div style={{ overflowX:"auto" }}>
+              {loading ? (
+                <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:13 }}>Loading trades…</div>
+              ) : sortedTrades.length === 0 ? (
+                <div style={{ padding:60, textAlign:"center", color:"#9ca3af", fontSize:14 }}>No trades in this window.</div>
+              ) : (
+                <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
+                  <thead>
+                    <tr>
+                      {SWING_BT_COLS.map(col => (
+                        <TH key={col.k} right={col.r} onClick={()=>toggleSort(col.k)} sorted={sort.k===col.k} dir={sort.dir}>{col.l}</TH>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedTrades.map((t, i) => {
+                      const win = t.result === "WIN";
+                      const open = t.result === "OPEN";
+                      const long = t.direction === "LONG";
+                      return (
+                        <tr key={i}
+                          style={{ borderBottom:"1px solid #f3f4f6", background:i%2===0?"#fff":"#fafafa" }}
+                          onMouseEnter={e=>e.currentTarget.style.background="#f5f3ff"}
+                          onMouseLeave={e=>e.currentTarget.style.background=i%2===0?"#fff":"#fafafa"}
+                        >
+                          <td style={{ padding:"10px 14px", fontWeight:700 }}>
+                            <span style={{ color:"#f59e0b" }}>{t.symbol.replace("USDT","")}</span>
+                            <span style={{ color:"#9ca3af", fontSize:10 }}>/USDT</span>
+                          </td>
+                          <td style={{ padding:"10px 14px" }}>
+                            <span style={{
+                              display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11,
+                              fontWeight:700, background:long?"#dcfce7":"#fee2e2", color:long?"#15803d":"#b91c1c"
+                            }}>{SWING_DIRECTION_LABEL[t.direction]}</span>
+                          </td>
+                          <td style={{ padding:"10px 14px", color:"#374151", whiteSpace:"nowrap", fontSize:11 }}>{fmtDateTime(t.entry_time)}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:600 }}>{fmtPrice(t.entry_price)}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#dc2626" }}>{fmtPrice(t.sl)}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#16a34a" }}>{fmtPrice(t.tp)}</td>
+                          <td style={{ padding:"10px 14px", color:"#374151", whiteSpace:"nowrap", fontSize:11 }}>
+                            {open ? <span style={{ color:"#9ca3af" }}>Still running</span> : fmtDateTime(t.exit_time)}
+                          </td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>
+                            {open ? <span style={{ color:"#9ca3af" }}>—</span> : fmtPrice(t.exit_price)}
+                          </td>
+                          <td style={{ padding:"10px 14px", color:"#6b7280", whiteSpace:"nowrap" }}>{fmtDuration(t.duration_ms)}</td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontWeight:700, fontVariantNumeric:"tabular-nums",
+                            color: open ? "#9ca3af" : t.gain_pct>=0?"#16a34a":"#dc2626"
+                          }}>
+                            {open ? "—" : `${t.gain_pct>=0?"+":""}${t.gain_pct.toFixed(2)}%`}
+                          </td>
+                          <td style={{ padding:"10px 14px", textAlign:"right", fontWeight:700, fontVariantNumeric:"tabular-nums",
+                            color: open ? "#9ca3af" : t.gain_dollar>=0?"#16a34a":"#dc2626"
+                          }}>
+                            {open ? "—" : `${t.gain_dollar>=0?"+":""}$${t.gain_dollar.toFixed(2)}`}
+                          </td>
+                          <td style={{ padding:"10px 14px" }}>
+                            <span style={{
+                              display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11, fontWeight:700,
+                              background: open ? "#e0f2fe" : win ? "#dcfce7" : "#fee2e2",
+                              color:      open ? "#0369a1" : win ? "#15803d" : "#b91c1c"
+                            }}>{t.result}</span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -2625,7 +3009,8 @@ export default function App() {
       {page === "backtest" && <BacktestPage scanRow={scanRow} onBack={goBackFromBacktest}/>}
       {page === "details" && <DetailsPage row={detailsRow} market={market} onBack={goBackFromDetails} onBacktest={goBacktest}/>}
       {page === "screener-backtest" && <ScreenerBacktestPage onBack={goBackFromDetails}/>}
-      {page === "swing-strategy" && <SwingStrategyPage onHome={goHome}/>}
+      {page === "swing-strategy" && <SwingStrategyPage onHome={goHome} onBacktest={() => setPage("swing-backtest")}/>}
+      {page === "swing-backtest" && <SwingBacktestPage onBack={() => setPage("swing-strategy")}/>}
     </>
   );
 }
