@@ -2401,7 +2401,7 @@ function HomePage({ onOpenScanner, onOpenSwing }) {
 const SWING_ALERT_BAND_PCT = 2; // rows within this distance to Z are the actionable watchlist
 // Backend direction values stay LONG/SHORT (matches the strategy spec's own
 // terminology) — displayed as BULLISH/BEARISH.
-const SWING_DIRECTION_LABEL = { LONG: "BULLISH", SHORT: "BEARISH" };
+const SWING_DIRECTION_LABEL = { LONG: "BUY", SHORT: "SELL" };
 // The live dashboard now keeps showing a side's last zone even after it
 // resolves (TP_HIT/SL_HIT), so a coin's most recent outcome stays visible
 // instead of vanishing the moment it closes — displayed here as a single
@@ -2415,22 +2415,27 @@ const SWING_STATE_DISPLAY = {
   EXPIRED:   { label: "EXPIRED",   bg: "#f3f4f6", color: "#9ca3af" },
 };
 const SWING_SL_TP_VISIBLE_STATES = ["TRIGGERED", "TP_HIT", "SL_HIT"];
+// Risk:Reward presets — sl/tp are whole percent values sent straight to
+// /api/swing-zones and /api/swing-backtest's sl_pct/tp_pct query params.
+const SWING_RR_MODES = [
+  { key: "1:2", label: "1:2", sl: 5, tp: 10 },
+  { key: "1:5", label: "1:5", sl: 2, tp: 10 },
+  { key: "1:3", label: "1:3", sl: 2, tp: 6 },
+];
 // Columns follow the 4-point flow in chronological order: 1) anchor
 // (peak/trough) 2) candidate (the swing low/high — Z's own candle)
 // 3) confirmation (the candle whose close ARMS the zone) 4) entry (the
-// candle that touches Z). Each point gets its own time + price pair.
+// candle that touches Z). Each point's time+price are combined into a
+// single column (price on top, time beneath), same stacking as the
+// State cell's badge+timestamp.
 const SWING_COLS = [
   {k:"symbol",           l:"Symbol"},
   {k:"direction",        l:"Direction"},
   {k:"state",            l:"State"},
-  {k:"anchor_time",      l:"1st Candle Time",  r:true},
-  {k:"anchor_price",     l:"1st Candle Price", r:true},
-  {k:"candidate_time",   l:"Z Candle Time",    r:true},
-  {k:"z",                l:"Z",                r:true},
-  {k:"detected_at",      l:"Confirm Time",     r:true},
-  {k:"confirm_price",    l:"Confirm Price",    r:true},
-  {k:"triggered_at",     l:"Entry Time",       r:true},
-  {k:"entry_price",      l:"Entry Price",      r:true},
+  {k:"anchor_price",     l:"1st Candle",  r:true},
+  {k:"z",                l:"Z Candle",    r:true},
+  {k:"confirm_price",    l:"Confirm",     r:true},
+  {k:"entry_price",      l:"Entry",       r:true},
   {k:"price",            l:"Price",            r:true},
   {k:"distance_pct",     l:"Distance %",       r:true},
   {k:"sl",               l:"SL",               r:true},
@@ -2447,6 +2452,7 @@ function SwingStrategyPage({ onHome, onBacktest }) {
   const [error, setError]               = useState(null);
   const [directionFilter, setDirectionFilter] = useState("All");
   const [stateFilter, setStateFilter]   = useState("All");
+  const [search, setSearch]             = useState("");
   const [sort, setSort]                 = useState({ k:"detected_at", dir:"desc" });
 
   // `silent` skips the loading flag so background polls don't blank the
@@ -2482,8 +2488,9 @@ function SwingStrategyPage({ onHome, onBacktest }) {
     if (directionFilter !== "All" && z.direction !== directionFilter.toUpperCase()) return false;
     if (stateFilter === "Completed" && !["TP_HIT","SL_HIT"].includes(z.state)) return false;
     if (stateFilter !== "All" && stateFilter !== "Completed" && z.state !== stateFilter.toUpperCase()) return false;
+    if (search && !z.symbol.toLowerCase().includes(search.toLowerCase())) return false;
     return true;
-  }), [zones, directionFilter, stateFilter]);
+  }), [zones, directionFilter, stateFilter, search]);
 
   // Distance % sorts by absolute value — it's the "how close to actionable"
   // metric (spec's primary sort key), not a signed one where +5% and -5%
@@ -2516,11 +2523,20 @@ function SwingStrategyPage({ onHome, onBacktest }) {
             </div>
           </div>
         </div>
-        <button onClick={() => load()} disabled={loading} style={{
-          padding:"7px 16px", borderRadius:8, border:"1px solid #e5e7eb",
-          background:"#fff", color:"#374151", fontSize:12, fontWeight:700,
-          cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.6 : 1,
-        }}>{loading ? "Scanning…" : "↻ Refresh"}</button>
+        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
+          <div style={{ position:"relative", width:180 }}>
+            <span style={{ position:"absolute", left:12, top:"50%", transform:"translateY(-50%)", color:"#9ca3af", fontSize:12 }}>⌕</span>
+            <input placeholder="Search coins…" value={search} onChange={e=>setSearch(e.target.value)} style={{
+              width:"100%", padding:"7px 12px 7px 28px", borderRadius:8, border:"1px solid #e5e7eb", fontSize:12,
+              color:"#374151", outline:"none", background:"#fff", boxSizing:"border-box",
+            }}/>
+          </div>
+          <button onClick={() => load()} disabled={loading} style={{
+            padding:"7px 16px", borderRadius:8, border:"1px solid #e5e7eb",
+            background:"#fff", color:"#374151", fontSize:12, fontWeight:700,
+            cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.6 : 1,
+          }}>{loading ? "Scanning…" : "↻ Refresh"}</button>
+        </div>
       </div>
 
       {loading ? (
@@ -2619,17 +2635,33 @@ function SwingStrategyPage({ onHome, onBacktest }) {
                           </div>
                         </td>
                         {/* 1st candle — anchor (peak/trough) */}
-                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.anchor_time)}</td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.anchor_price)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right" }}>
+                          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                            <span style={{ fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.anchor_price)}</span>
+                            <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtTime(z.anchor_time)}</span>
+                          </div>
+                        </td>
                         {/* Z candle — the swing low/high itself */}
-                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.candidate_time)}</td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{fmtPrice(z.z)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right" }}>
+                          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                            <span style={{ fontVariantNumeric:"tabular-nums" }}>{fmtPrice(z.z)}</span>
+                            <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtTime(z.candidate_time)}</span>
+                          </div>
+                        </td>
                         {/* Confirming candle */}
-                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.detected_at)}</td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.confirm_price)}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right" }}>
+                          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                            <span style={{ fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.confirm_price)}</span>
+                            <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtTime(z.detected_at)}</span>
+                          </div>
+                        </td>
                         {/* Entry candle */}
-                        <td style={{ padding:"11px 14px", textAlign:"right", color:"#6b7280", whiteSpace:"nowrap", fontSize:12 }}>{fmtTime(z.triggered_at)}</td>
-                        <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>{z.triggered_at ? fmtPrice(z.entry_price) : "—"}</td>
+                        <td style={{ padding:"11px 14px", textAlign:"right" }}>
+                          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                            <span style={{ fontVariantNumeric:"tabular-nums" }}>{z.triggered_at ? fmtPrice(z.entry_price) : "—"}</span>
+                            <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{z.triggered_at ? fmtTime(z.triggered_at) : ""}</span>
+                          </div>
+                        </td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:600 }}>{fmtPrice(z.price)}</td>
                         <td style={{ padding:"11px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:700, color: alert ? "#b45309" : "#374151" }}>
                           {z.distance_pct>=0?"+":""}{z.distance_pct.toFixed(2)}%
@@ -2664,14 +2696,15 @@ function SwingStrategyPage({ onHome, onBacktest }) {
 const SWING_BT_PERIOD_LABELS = [["day","Day"],["week","Week"],["month","Month"]];
 const SWING_BT_PERIOD_DAYS = { day: 1, week: 7, month: 30 };
 const SWING_BT_COLS = [
-  {k:"symbol",      l:"Symbol"},
-  {k:"direction",   l:"Direction"},
-  {k:"entry_time",  l:"Entry Time"},
-  {k:"entry_price", l:"Entry Price", r:true},
+  {k:"symbol",        l:"Symbol"},
+  {k:"direction",     l:"Direction"},
+  {k:"anchor_price",  l:"1st Candle", r:true},
+  {k:"z",             l:"Z Candle",   r:true},
+  {k:"confirm_price", l:"Confirm",    r:true},
+  {k:"entry_price", l:"Entry",       r:true},
   {k:"sl",          l:"Stop Loss",   r:true},
   {k:"tp",          l:"Take Profit", r:true},
-  {k:"exit_time",   l:"Exit Time"},
-  {k:"exit_price",  l:"Exit Price",  r:true},
+  {k:"exit_price",  l:"Exit",        r:true},
   {k:"duration_ms", l:"Duration",    r:true},
   {k:"gain_pct",    l:"PnL %",       r:true},
   {k:"gain_dollar", l:"PnL ($)",     r:true},
@@ -2683,7 +2716,8 @@ function SwingBacktestPage({ onBack }) {
   const [customStart, setCustomStart] = useState("");
   const [customEnd, setCustomEnd]     = useState("");
   const [capital, setCapital]         = useState(1000);
-  const [directionFilter, setDirectionFilter] = useState("All");
+  const [rrMode, setRrMode]           = useState("1:2");
+  const [search, setSearch]           = useState("");
   const [loading, setLoading]         = useState(true);
   const [error, setError]             = useState(null);
   const [allTrades, setAllTrades]     = useState([]);
@@ -2694,7 +2728,8 @@ function SwingBacktestPage({ onBack }) {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`${API_BASE}/swing-backtest`);
+      const rr = SWING_RR_MODES.find(m => m.key === rrMode) || SWING_RR_MODES[0];
+      const res = await fetch(`${API_BASE}/swing-backtest?sl_pct=${rr.sl}&tp_pct=${rr.tp}`);
       if (!res.ok) throw new Error(`API ${res.status}`);
       const json = await res.json();
       setAllTrades(json.trades || []);
@@ -2704,7 +2739,7 @@ function SwingBacktestPage({ onBack }) {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [rrMode]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -2732,9 +2767,10 @@ function SwingBacktestPage({ onBack }) {
     [allTrades, rangeStartMs, rangeEndMs]
   );
 
-  const filteredTrades = useMemo(() => (
-    directionFilter === "All" ? windowTrades : windowTrades.filter(t => t.direction === directionFilter.toUpperCase())
-  ), [windowTrades, directionFilter]);
+  const filteredTrades = useMemo(() => windowTrades.filter(t => {
+    if (search && !t.symbol.toLowerCase().includes(search.toLowerCase())) return false;
+    return true;
+  }), [windowTrades, search]);
 
   // Capital-based $ PnL — trades are otherwise fixed-percentage (+TP_PCT or
   // -SL_PCT), so this is the only place "capital" actually matters.
@@ -2801,8 +2837,15 @@ function SwingBacktestPage({ onBack }) {
         <span style={{ color:"#d1d5db", fontSize:14 }}>›</span>
         <span style={{ fontWeight:800, fontSize:17 }}>Swing Backtest Summary</span>
         <span style={{ color:"#9ca3af", fontSize:12 }}>All qualifying coins · Swing Zone Retest</span>
+        <div style={{ marginLeft:"auto", position:"relative", width:180 }}>
+          <span style={{ position:"absolute", left:12, top:"50%", transform:"translateY(-50%)", color:"#9ca3af", fontSize:12 }}>⌕</span>
+          <input placeholder="Search coins…" value={search} onChange={e=>setSearch(e.target.value)} style={{
+            width:"100%", padding:"7px 12px 7px 28px", borderRadius:8, border:"1px solid #e5e7eb", fontSize:12,
+            color:"#374151", outline:"none", background:"#fff", boxSizing:"border-box",
+          }}/>
+        </div>
         <button onClick={exportCsv} disabled={exporting || loading || sortedTrades.length === 0} style={{
-          marginLeft:"auto", display:"flex", alignItems:"center", gap:6,
+          display:"flex", alignItems:"center", gap:6,
           padding:"7px 16px", borderRadius:8, border:"none",
           background:"#111827", color:"#fff", fontSize:12, fontWeight:700,
           cursor: (exporting || loading || sortedTrades.length === 0) ? "not-allowed" : "pointer",
@@ -2839,15 +2882,16 @@ function SwingBacktestPage({ onBack }) {
             />
           </div>
           <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
-          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>Direction</span>
+          <span style={{ fontSize:11, color:"#9ca3af", fontWeight:700, letterSpacing:"0.06em", textTransform:"uppercase" }}>RR</span>
           <div style={{ display:"flex", gap:4 }}>
-            {["All","Long","Short"].map(d => (
-              <button key={d} onClick={()=>setDirectionFilter(d)} style={{
-                padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700, cursor:"pointer",
-                border: directionFilter===d ? "1.5px solid #6366f1" : "1px solid #e5e7eb",
-                background: directionFilter===d ? "#eef2ff" : "#fff",
-                color: directionFilter===d ? "#6366f1" : "#6b7280",
-              }}>{d === "All" ? "All" : SWING_DIRECTION_LABEL[d.toUpperCase()]}</button>
+            {SWING_RR_MODES.map(m => (
+              <button key={m.key} disabled={loading} onClick={()=>setRrMode(m.key)} title={`${m.sl}% SL / ${m.tp}% TP`} style={{
+                padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:700,
+                cursor: loading ? "not-allowed" : "pointer", opacity: loading && rrMode!==m.key ? 0.5 : 1,
+                border: rrMode===m.key ? "1.5px solid #f59e0b" : "1px solid #e5e7eb",
+                background: rrMode===m.key ? "#fff7ed" : "#fff",
+                color: rrMode===m.key ? "#f59e0b" : "#6b7280",
+              }}>{m.label}</button>
             ))}
           </div>
           <div style={{ width:1, height:20, background:"#e5e7eb" }}/>
@@ -2934,15 +2978,44 @@ function SwingBacktestPage({ onBack }) {
                               fontWeight:700, background:long?"#dcfce7":"#fee2e2", color:long?"#15803d":"#b91c1c"
                             }}>{SWING_DIRECTION_LABEL[t.direction]}</span>
                           </td>
-                          <td style={{ padding:"10px 14px", color:"#374151", whiteSpace:"nowrap", fontSize:11 }}>{fmtDateTime(t.entry_time)}</td>
-                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", fontWeight:600 }}>{fmtPrice(t.entry_price)}</td>
+                          {/* 1st candle — anchor (peak/trough) */}
+                          <td style={{ padding:"10px 14px", textAlign:"right" }}>
+                            <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                              <span style={{ fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(t.anchor_price)}</span>
+                              <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtDateTime(t.anchor_time)}</span>
+                            </div>
+                          </td>
+                          {/* Z candle — the swing low/high itself */}
+                          <td style={{ padding:"10px 14px", textAlign:"right" }}>
+                            <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                              <span style={{ fontVariantNumeric:"tabular-nums" }}>{fmtPrice(t.z)}</span>
+                              <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtDateTime(t.candidate_time)}</span>
+                            </div>
+                          </td>
+                          {/* Confirming candle */}
+                          <td style={{ padding:"10px 14px", textAlign:"right" }}>
+                            <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                              <span style={{ fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(t.confirm_price)}</span>
+                              <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtDateTime(t.detected_at)}</span>
+                            </div>
+                          </td>
+                          {/* Entry candle — time+price merged into one column */}
+                          <td style={{ padding:"10px 14px", textAlign:"right" }}>
+                            <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                              <span style={{ fontVariantNumeric:"tabular-nums", fontWeight:600 }}>{fmtPrice(t.entry_price)}</span>
+                              <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtDateTime(t.entry_time)}</span>
+                            </div>
+                          </td>
                           <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#dc2626" }}>{fmtPrice(t.sl)}</td>
                           <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums", color:"#16a34a" }}>{fmtPrice(t.tp)}</td>
-                          <td style={{ padding:"10px 14px", color:"#374151", whiteSpace:"nowrap", fontSize:11 }}>
-                            {open ? <span style={{ color:"#9ca3af" }}>Still running</span> : fmtDateTime(t.exit_time)}
-                          </td>
-                          <td style={{ padding:"10px 14px", textAlign:"right", fontVariantNumeric:"tabular-nums" }}>
-                            {open ? <span style={{ color:"#9ca3af" }}>—</span> : fmtPrice(t.exit_price)}
+                          {/* Exit candle — time+price merged into one column */}
+                          <td style={{ padding:"10px 14px", textAlign:"right" }}>
+                            {open ? <span style={{ color:"#9ca3af" }}>Still running</span> : (
+                              <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                                <span style={{ fontVariantNumeric:"tabular-nums" }}>{fmtPrice(t.exit_price)}</span>
+                                <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtDateTime(t.exit_time)}</span>
+                              </div>
+                            )}
                           </td>
                           <td style={{ padding:"10px 14px", color:"#6b7280", whiteSpace:"nowrap" }}>{fmtDuration(t.duration_ms)}</td>
                           <td style={{ padding:"10px 14px", textAlign:"right", fontWeight:700, fontVariantNumeric:"tabular-nums",

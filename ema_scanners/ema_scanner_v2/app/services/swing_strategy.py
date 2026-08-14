@@ -26,7 +26,9 @@ BOTH of the following legs, each >= SWING_THRESHOLD, before it arms a zone:
     4. Zone level Z = L.low (the candle's own extreme, the same value as
        "swing_extreme" below — not its close), projected forward and ARMED.
     5. Entry: price trades back down and touches Z (intrabar low <= Z).
-    6. Stop: Z * (1 - SL_PCT). Target: Z * (1 + TP_PCT).
+    6. Stop: Z * (1 - sl_pct). Target: Z * (1 + tp_pct) — both configurable
+       per call (see the RR presets in app/api/swing_strategy.py), default
+       5% / 10%.
     7. Invalidation: a candle CLOSES at or beyond the stop level (a close-
        based rule, distinct from the wick-based entry touch).
     8. After confirming, the anchor/candidate reset and the search starts
@@ -55,8 +57,12 @@ from app.services.repository import CandleRepository
 
 TIMEFRAME = "1d"
 SWING_THRESHOLD = 0.10          # confirmation move required, EACH leg (down and up)
-TP_PCT = 0.10                   # target distance from Z
-SL_PCT = 0.05                   # stop distance from Z
+# Default risk:reward — SL/TP distance from Z as a fraction. Both scan_swing_
+# zones and scan_swing_backtest accept sl_pct/tp_pct overrides (see the RR
+# presets exposed in app/api/swing_strategy.py: 1:2 5%/10%, 1:5 2%/10%,
+# 1:3 2%/6%), so these are just what's used when nothing else is passed.
+DEFAULT_TP_PCT = 0.10
+DEFAULT_SL_PCT = 0.05
 DEFAULT_CONFIRM_FROM = "wick"   # "wick" | "close" — see module docstring
 DEFAULT_MIN_VOLUME_USDT = 5_000_000.0
 # An ARMED zone (confirmed but never retested) more than this many candles
@@ -67,6 +73,14 @@ DEFAULT_MIN_VOLUME_USDT = 5_000_000.0
 # TP_HIT/SL_HIT is unaffected either way.
 DEFAULT_MAX_ZONE_AGE = 30
 LIVE_STATES = ("ARMED", "TRIGGERED")
+# The backtest can carry thousands of historical trades — intraday-refining
+# entry_time/exit_time for every one of them (2+ extra DB queries each)
+# turned a full scan into ~35s. Only bother refining trades whose entry
+# happened within this many candles (days) of the most recent one; older
+# trades fall back to the coarser day-level timestamp (still shows the
+# right day, just not the exact minute) rather than paying that cost for
+# history nobody's actively re-checking.
+BACKTEST_REFINE_RECENT_DAYS = 60
 # A 1d candle's own open_time is always UTC midnight regardless of when
 # within that day a moment (confirmation / entry touch / TP-SL resolution)
 # actually happened — cross-referencing finer stored intervals narrows
@@ -82,6 +96,7 @@ DAY_MS = 86_400_000
 def _make_zone(
     anchor: dict, anchor_idx: int, extreme: dict, extreme_idx: int,
     pivot_type: str, move_pct: float, idx: int, confirm_price: float,
+    sl_pct: float, tp_pct: float,
 ) -> dict:
     is_long = pivot_type == "low"
     # Zone level Z = the candidate candle's own extreme (its low for a BUY
@@ -95,8 +110,8 @@ def _make_zone(
     return {
         "z": z,
         "state": "ARMED",
-        "sl": z * (1 - SL_PCT) if is_long else z * (1 + SL_PCT),
-        "tp": z * (1 + TP_PCT) if is_long else z * (1 - TP_PCT),
+        "sl": z * (1 - sl_pct) if is_long else z * (1 + sl_pct),
+        "tp": z * (1 + tp_pct) if is_long else z * (1 - tp_pct),
         "swing_extreme": extreme["low"] if is_long else extreme["high"],
         "confirm_move_pct": move_pct,
         "confirm_price": confirm_price,  # the confirming candle's own close
@@ -112,6 +127,7 @@ def _make_zone(
 
 def _run_side_history(
     candles: list[dict], side: str, confirm_from: str, max_zone_age: int | None,
+    sl_pct: float = DEFAULT_SL_PCT, tp_pct: float = DEFAULT_TP_PCT,
 ) -> list[dict]:
     """Replays one coin's full candle history once for one side ("long" or
     "short"), independently of the other side, and returns EVERY zone ever
@@ -226,6 +242,7 @@ def _run_side_history(
                 zone = _make_zone(
                     anchor, anchor_idx, candidate, candidate_idx,
                     "low" if side == "long" else "high", move_pct, idx, c["close"],
+                    sl_pct, tp_pct,
                 )
                 history.append(zone)
                 # restart the search for this side's next swing point
@@ -236,13 +253,14 @@ def _run_side_history(
 
 def _run_side(
     candles: list[dict], side: str, confirm_from: str, max_zone_age: int | None,
+    sl_pct: float = DEFAULT_SL_PCT, tp_pct: float = DEFAULT_TP_PCT,
 ) -> dict | None:
     """Live-dashboard view: this side's most recent zone, whatever its
     state — ARMED/TRIGGERED (still live) or TP_HIT/SL_HIT/EXPIRED
     (completed) — so a coin's last completed outcome keeps showing on the
     dashboard until a new zone confirms on that side, instead of vanishing
     the moment it resolves."""
-    history = _run_side_history(candles, side, confirm_from, max_zone_age)
+    history = _run_side_history(candles, side, confirm_from, max_zone_age, sl_pct, tp_pct)
     return history[-1] if history else None
 
 
@@ -326,6 +344,8 @@ async def scan_swing_zones(
     min_volume_usdt: float = DEFAULT_MIN_VOLUME_USDT,
     confirm_from: str = DEFAULT_CONFIRM_FROM,
     max_zone_age: int | None = DEFAULT_MAX_ZONE_AGE,
+    sl_pct: float = DEFAULT_SL_PCT,
+    tp_pct: float = DEFAULT_TP_PCT,
 ) -> dict:
     """Scans every coin with stored 1d candles, keeps the ones whose latest
     day's approximate USD volume (volume * close — 1d candle volume already
@@ -349,7 +369,7 @@ async def scan_swing_zones(
         latest_idx = len(candles) - 1
 
         for side in ("long", "short"):
-            zone = _run_side(candles, side, confirm_from, max_zone_age)
+            zone = _run_side(candles, side, confirm_from, max_zone_age, sl_pct, tp_pct)
             if zone is None:
                 continue
             day_open_time = candles[zone["confirmed_at"]]["open_time"]
@@ -427,8 +447,8 @@ async def scan_swing_zones(
         "min_volume_usdt": min_volume_usdt,
         "confirm_from": confirm_from,
         "swing_threshold": SWING_THRESHOLD,
-        "tp_pct": TP_PCT,
-        "sl_pct": SL_PCT,
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
         "symbols_scanned": symbols_scanned,
         "zones": rows,
     }
@@ -440,6 +460,8 @@ async def scan_swing_backtest(
     min_volume_usdt: float = DEFAULT_MIN_VOLUME_USDT,
     confirm_from: str = DEFAULT_CONFIRM_FROM,
     max_zone_age: int | None = DEFAULT_MAX_ZONE_AGE,
+    sl_pct: float = DEFAULT_SL_PCT,
+    tp_pct: float = DEFAULT_TP_PCT,
 ) -> dict:
     """Scans every coin with stored 1d candles (same $-volume filter as
     scan_swing_zones) and returns every historical trade that actually had
@@ -448,7 +470,7 @@ async def scan_swing_backtest(
     that confirmed but were never retested/entered aren't trades and are
     excluded. Entry is always exactly Z and exit is always exactly TP or
     SL (this strategy has no slippage/partial-fill concept), so every
-    WIN/LOSS has the identical fixed PnL% (+TP_PCT / -SL_PCT) — only which
+    WIN/LOSS has the identical fixed PnL% (+tp_pct / -sl_pct) — only which
     coin and when differ. Sorted oldest entry first, matching a backtest
     trade log rather than the live dashboard's distance-to-Z ordering."""
     candles_by_symbol = await CandleRepository.get_ohlc_by_symbol(db, interval=TIMEFRAME, market=market)
@@ -463,20 +485,62 @@ async def scan_swing_backtest(
         if approx_volume_usdt < min_volume_usdt:
             continue
         symbols_scanned += 1
+        latest_idx = len(candles) - 1
 
         for side in ("long", "short"):
-            for zone in _run_side_history(candles, side, confirm_from, max_zone_age):
+            for zone in _run_side_history(candles, side, confirm_from, max_zone_age, sl_pct, tp_pct):
                 if zone["triggered_at"] is None:
                     continue  # never retested/entered — not a trade
                 if zone["state"] == "TP_HIT":
-                    result, exit_price, gain_pct = "WIN", zone["tp"], TP_PCT * 100
+                    result, exit_price, gain_pct = "WIN", zone["tp"], tp_pct * 100
                 elif zone["state"] == "SL_HIT":
-                    result, exit_price, gain_pct = "LOSS", zone["sl"], -SL_PCT * 100
+                    result, exit_price, gain_pct = "LOSS", zone["sl"], -sl_pct * 100
                 else:  # still TRIGGERED, unresolved
                     result, exit_price, gain_pct = "OPEN", None, None
 
-                entry_time = candles[zone["triggered_at"]]["open_time"]
-                exit_time = candles[zone["resolved_at"]]["open_time"] if zone["resolved_at"] is not None else None
+                # Same intraday refinement as the live dashboard (see
+                # scan_swing_zones), but only for recent trades — refining
+                # all of them (2+ extra DB queries each) was turning a full
+                # backtest scan into ~35s. Older trades keep the coarser
+                # day-level timestamp (still the correct day, just not the
+                # exact minute).
+                is_recent = (latest_idx - zone["triggered_at"]) <= BACKTEST_REFINE_RECENT_DAYS
+                entry_day = candles[zone["triggered_at"]]["open_time"]
+                if is_recent:
+                    entry_time = await _refine_moment(db, symbol, market, entry_day, _touch_predicate(zone["z"], side))
+                else:
+                    entry_time = entry_day
+
+                if zone["resolved_at"] is not None and zone["state"] in ("TP_HIT", "SL_HIT"):
+                    exit_day = candles[zone["resolved_at"]]["open_time"]
+                    if is_recent:
+                        exit_time = await _refine_moment(
+                            db, symbol, market, exit_day,
+                            _resolution_predicate(zone["sl"], zone["tp"], side, zone["state"]),
+                        )
+                    else:
+                        exit_time = exit_day
+                elif zone["resolved_at"] is not None:
+                    exit_time = candles[zone["resolved_at"]]["open_time"]  # EXPIRED — no finer condition to refine against
+                else:
+                    exit_time = None
+
+                # Same 4-point timeline as the live dashboard (see
+                # scan_swing_zones): anchor (point 1), candidate/Z (point
+                # 2), confirmation (point 3). Gated by the same is_recent
+                # flag as entry/exit above, for the same performance reason.
+                confirm_day = candles[zone["confirmed_at"]]["open_time"]
+                reference = zone["swing_extreme"] if confirm_from == "wick" else zone["z"]
+                if is_recent:
+                    detected_at = await _refine_moment(db, symbol, market, confirm_day, _confirm_predicate(reference, side))
+                    anchor_day = candles[zone["anchor_at"]]["open_time"]
+                    anchor_time = await _refine_extreme_moment(db, symbol, market, anchor_day, seeking_high=(side == "long"))
+                    candidate_day = candles[zone["candidate_at"]]["open_time"]
+                    candidate_time = await _refine_extreme_moment(db, symbol, market, candidate_day, seeking_high=(side == "short"))
+                else:
+                    detected_at = confirm_day
+                    anchor_time = candles[zone["anchor_at"]]["open_time"]
+                    candidate_time = candles[zone["candidate_at"]]["open_time"]
 
                 trades.append({
                     "symbol": symbol,
@@ -484,7 +548,11 @@ async def scan_swing_backtest(
                     "z": zone["z"],
                     "sl": zone["sl"],
                     "tp": zone["tp"],
-                    "detected_at": candles[zone["confirmed_at"]]["open_time"],
+                    "anchor_time": anchor_time,
+                    "anchor_price": zone["anchor_price"],
+                    "candidate_time": candidate_time,
+                    "detected_at": detected_at,
+                    "confirm_price": zone["confirm_price"],
                     "entry_time": entry_time,
                     "exit_time": exit_time,
                     "entry_price": zone["z"],
@@ -501,8 +569,8 @@ async def scan_swing_backtest(
         "timeframe": TIMEFRAME,
         "min_volume_usdt": min_volume_usdt,
         "confirm_from": confirm_from,
-        "tp_pct": TP_PCT,
-        "sl_pct": SL_PCT,
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
         "symbols_scanned": symbols_scanned,
         "trades": trades,
     }
