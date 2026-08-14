@@ -2417,10 +2417,11 @@ const SWING_STATE_DISPLAY = {
 const SWING_SL_TP_VISIBLE_STATES = ["TRIGGERED", "TP_HIT", "SL_HIT"];
 // Risk:Reward presets — sl/tp are whole percent values sent straight to
 // /api/swing-zones and /api/swing-backtest's sl_pct/tp_pct query params.
+// Matches the strategy spec's own two-variant backtest matrix exactly
+// (-5%/+10% and -2%/+10%) — no extra presets beyond what's specified.
 const SWING_RR_MODES = [
   { key: "1:2", label: "1:2", sl: 5, tp: 10 },
   { key: "1:5", label: "1:5", sl: 2, tp: 10 },
-  { key: "1:3", label: "1:3", sl: 2, tp: 6 },
 ];
 // Columns follow the 4-point flow in chronological order: 1) anchor
 // (peak/trough) 2) candidate (the swing low/high — Z's own candle)
