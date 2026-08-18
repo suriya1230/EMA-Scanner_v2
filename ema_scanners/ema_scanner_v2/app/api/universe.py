@@ -7,6 +7,11 @@ different strategies can be tried/backtested against any qualifying coin.
 POST /api/collect-universe — scans + fetches, returns a summary once done
                               (min-volume used / symbols scanned / stored /
                               errors). Can take a while for hundreds of coins.
+                              Also runs automatically on a timer (see
+                              universe_collector.py's scheduler) — this route
+                              and that scheduler share one lock, so a manual
+                              click while a scheduled run is mid-flight
+                              returns 409 instead of overlapping it.
 GET  /api/universe-summary  — every stored coin's EMA 7/25/99 trend plus
                               overall Bullish/Bearish/Neutral/stored counts,
                               computed from DB data only (no Binance calls).
@@ -20,12 +25,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.services.live_stream import restart_live_stream, status as live_stream_status
-from app.services.universe_collector import collect_universe
+from app.services.universe_collector import run_collect_universe_guarded
 from app.services.universe_summary import summarize_universe
 
 router = APIRouter(prefix="/api", tags=["universe"])
@@ -38,7 +43,9 @@ async def collect_universe_endpoint(
         description="Minimum 24h quote volume in USDT. Defaults to MIN_VOLUME_USDT_SIGNAL from .env (1,000,000).",
     ),
 ):
-    result = await collect_universe(min_volume_usdt)
+    result = await run_collect_universe_guarded(min_volume_usdt)
+    if result is None:
+        raise HTTPException(status_code=409, detail="Universe collection already in progress (scheduled or manual) — try again shortly.")
     # Re-subscribe the live WebSocket stream so any newly-stored symbols
     # start getting real-time updates without needing a backend restart.
     await restart_live_stream()

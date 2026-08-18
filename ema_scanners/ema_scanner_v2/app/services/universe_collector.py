@@ -26,6 +26,7 @@ import ccxt.async_support as ccxt
 from app.core.config import settings
 from app.services.csv_import import _ensure_candles, _retry
 from app.services.intervals import UNIVERSE_INTERVALS
+from app.services.live_stream import restart_live_stream
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,15 @@ logger = logging.getLogger(__name__)
 # net against actually hitting Binance's limit; this just caps how many
 # requests can be in flight waiting on that throttle at once.
 FETCH_CONCURRENCY = 10
+
+# A full collection run (hundreds of coins x 8 intervals, thousands of
+# REST calls under the adaptive rate throttle) takes several minutes —
+# much longer than this interval. _collect_lock (below) is the guard that
+# actually matters: it's what stops runs from ever overlapping, whether
+# triggered by the scheduler or a manual "Collect Universe" click.
+SCHEDULE_INTERVAL_SECONDS = 60
+_scheduler_task: asyncio.Task | None = None
+_collect_lock = asyncio.Lock()
 
 
 async def collect_universe(min_volume_usdt: float | None = None) -> dict:
@@ -105,3 +115,54 @@ async def collect_universe(min_volume_usdt: float | None = None) -> dict:
         "pairs_stored": len(qualifying) * len(UNIVERSE_INTERVALS) - len(errors),
         "errors": errors,
     }
+
+
+async def run_collect_universe_guarded(min_volume_usdt: float | None = None) -> dict | None:
+    """Runs collect_universe(), but skips it (returns None) instead of
+    queueing behind or overlapping a run that's already in progress — used
+    by both the scheduler below and the manual "Collect Universe" button's
+    API route, so the two can never run concurrently either."""
+    if _collect_lock.locked():
+        return None
+    async with _collect_lock:
+        return await collect_universe(min_volume_usdt)
+
+
+async def _scheduler_loop() -> None:
+    """Fires run_collect_universe_guarded() every SCHEDULE_INTERVAL_SECONDS.
+    A full run takes far longer than this interval, so most ticks will find
+    the lock held and simply skip — logged, not silent, so it's obvious in
+    the logs that the schedule is intentionally being throttled by the lock
+    rather than something being broken."""
+    while True:
+        await asyncio.sleep(SCHEDULE_INTERVAL_SECONDS)
+        if _collect_lock.locked():
+            logger.info("Universe collector: previous run still in progress, skipping this tick.")
+            continue
+        try:
+            result = await run_collect_universe_guarded()
+            if result is not None:
+                # Re-subscribe the live WebSocket stream so any newly-
+                # discovered coins start getting real-time updates right
+                # away, same as after a manual "Collect Universe" click.
+                await restart_live_stream()
+        except Exception:
+            logger.exception("Universe collector: scheduled run failed.")
+
+
+def start_scheduler() -> None:
+    global _scheduler_task
+    if _scheduler_task is None or _scheduler_task.done():
+        _scheduler_task = asyncio.create_task(_scheduler_loop())
+        logger.info("Universe collector: scheduler started (every %ds).", SCHEDULE_INTERVAL_SECONDS)
+
+
+async def stop_scheduler() -> None:
+    global _scheduler_task
+    if _scheduler_task is not None:
+        _scheduler_task.cancel()
+        try:
+            await _scheduler_task
+        except asyncio.CancelledError:
+            pass
+        _scheduler_task = None

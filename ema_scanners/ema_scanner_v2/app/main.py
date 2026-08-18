@@ -11,7 +11,11 @@ Two independent ways candle data gets into the DB:
      Live Candle Stream (app/services/live_stream.py) keeps those same
      coins' 1h candles updated in real time over a Binance WebSocket
      connection, started in this file's lifespan and restarted whenever
-     Collect Universe finishes (to pick up newly-stored symbols).
+     Collect Universe finishes (to pick up newly-stored symbols). Collect
+     Universe also runs on its own 1-minute-interval scheduler (started
+     here too) — most ticks skip because a run takes far longer than a
+     minute and the scheduler shares a lock with the manual button, so
+     runs never overlap each other.
 
 There is no auto-detected EMA-crossover *signal* generation any more — the
 `/api/signals` and `/api/candles/{symbol}` routes in app/api/scanner.py are
@@ -35,6 +39,7 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.db.database import init_db
 from app.services.live_stream import start_live_stream, start_watchdog, stop_live_stream, stop_watchdog
+from app.services.universe_collector import start_scheduler as start_universe_scheduler, stop_scheduler as stop_universe_scheduler
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -59,12 +64,14 @@ async def lifespan(app: FastAPI):
 
     await start_live_stream()
     start_watchdog()
+    start_universe_scheduler()
 
     logger.info("EMA Scanner is ready. 🚀")
 
     yield  # ── App is running ──
 
     logger.info("Shutting down...")
+    await stop_universe_scheduler()
     await stop_watchdog()
     await stop_live_stream()
 
