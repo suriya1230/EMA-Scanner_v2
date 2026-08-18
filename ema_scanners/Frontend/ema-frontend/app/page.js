@@ -4,7 +4,7 @@ import { useState, useEffect, useCallback, useRef, useMemo, memo } from "react";
 import { TrendingUp, TrendingDown, Target, Database, CheckCircle2, XCircle, DollarSign, Award, CalendarClock } from "lucide-react";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8001/api";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api";
 
 const MARKETS = ["futures", "spot"];
 
@@ -2433,6 +2433,7 @@ const SWING_COLS = [
   {k:"symbol",           l:"Symbol"},
   {k:"direction",        l:"Direction"},
   {k:"state",            l:"State"},
+  {k:"zeroth_price",     l:"0 Candle",    r:true},
   {k:"anchor_price",     l:"1st Candle",  r:true},
   {k:"z",                l:"Z Candle",    r:true},
   {k:"confirm_price",    l:"Confirm",     r:true},
@@ -2635,6 +2636,13 @@ function SwingStrategyPage({ onHome, onBacktest }) {
                             </span>
                           </div>
                         </td>
+                        {/* 0 candle — the prior extreme that validated the anchor (point 1) */}
+                        <td style={{ padding:"11px 14px", textAlign:"right" }}>
+                          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                            <span style={{ fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(z.zeroth_price)}</span>
+                            <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{fmtTime(z.zeroth_time)}</span>
+                          </div>
+                        </td>
                         {/* 1st candle — anchor (peak/trough) */}
                         <td style={{ padding:"11px 14px", textAlign:"right" }}>
                           <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
@@ -2699,6 +2707,7 @@ const SWING_BT_PERIOD_DAYS = { day: 1, week: 7, month: 30 };
 const SWING_BT_COLS = [
   {k:"symbol",        l:"Symbol"},
   {k:"direction",     l:"Direction"},
+  {k:"zeroth_price",  l:"0 Candle",   r:true},
   {k:"anchor_price",  l:"1st Candle", r:true},
   {k:"z",             l:"Z Candle",   r:true},
   {k:"confirm_price", l:"Confirm",    r:true},
@@ -2800,18 +2809,41 @@ function SwingBacktestPage({ onBack }) {
   const exportCsv = useCallback(() => {
     setExporting(true);
     try {
-      const header = ["Symbol","Direction","Entry Time","Entry Price","Stop Loss","Take Profit","Exit Time","Exit Price","Duration","PnL %","PnL ($)","Result"];
+      const header = [
+        "Symbol","Direction",
+        "0 Candle Time","0 Candle Price",
+        "1st Candle Time","1st Candle Price",
+        "Z Candle Time","Z Candle Price",
+        "Confirm Time","Confirm Price",
+        "Entry Time","Entry Price","Stop Loss","Take Profit",
+        "Exit Time","Exit Price","Duration","PnL %","PnL ($)","Result",
+      ];
       const csvEscape = v => `"${String(v ?? "").replace(/"/g, '""')}"`;
       const lines = [header.join(",")];
       for (const t of sortedTrades) {
         const open = t.result === "OPEN";
         lines.push([
-          t.symbol, SWING_DIRECTION_LABEL[t.direction], fmtDateTime(t.entry_time), t.entry_price, t.sl, t.tp,
+          t.symbol, SWING_DIRECTION_LABEL[t.direction],
+          t.zeroth_time ? fmtDateTime(t.zeroth_time) : "", t.zeroth_price ?? "",
+          fmtDateTime(t.anchor_time), t.anchor_price,
+          fmtDateTime(t.candidate_time), t.z,
+          fmtDateTime(t.detected_at), t.confirm_price,
+          fmtDateTime(t.entry_time), t.entry_price, t.sl, t.tp,
           open ? "Still running" : fmtDateTime(t.exit_time), open ? "" : t.exit_price,
           fmtDuration(t.duration_ms), open ? "" : t.gain_pct.toFixed(2), open ? "" : t.gain_dollar.toFixed(2),
           t.result,
         ].map(csvEscape).join(","));
       }
+
+      lines.push("");
+      lines.push("Summary");
+      lines.push(["Total Trades","Won","Loss","Win Rate %","PnL ($)"].map(csvEscape).join(","));
+      lines.push([
+        stats.total, stats.won, stats.lost,
+        stats.winRate != null ? stats.winRate.toFixed(1) : "—",
+        stats.pnlDollar.toFixed(2),
+      ].map(csvEscape).join(","));
+
       const blob = new Blob(["﻿" + lines.join("\n")], { type: "text/csv;charset=utf-8;" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -2824,7 +2856,7 @@ function SwingBacktestPage({ onBack }) {
     } finally {
       setExporting(false);
     }
-  }, [sortedTrades, btPeriod]);
+  }, [sortedTrades, btPeriod, stats]);
 
   return (
     <div style={{ fontFamily:"'Inter',system-ui,sans-serif", background:"#f5f6f8", minHeight:"100vh", width:"100%", color:"#111827" }}>
@@ -2978,6 +3010,13 @@ function SwingBacktestPage({ onBack }) {
                               display:"inline-block", padding:"2px 8px", borderRadius:4, fontSize:11,
                               fontWeight:700, background:long?"#dcfce7":"#fee2e2", color:long?"#15803d":"#b91c1c"
                             }}>{SWING_DIRECTION_LABEL[t.direction]}</span>
+                          </td>
+                          {/* 0 candle — the prior extreme that validated the anchor (point 1) */}
+                          <td style={{ padding:"10px 14px", textAlign:"right" }}>
+                            <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:2 }}>
+                              <span style={{ fontVariantNumeric:"tabular-nums", color:"#9ca3af" }}>{fmtPrice(t.zeroth_price)}</span>
+                              <span style={{ fontSize:10, color:"#9ca3af", whiteSpace:"nowrap" }}>{t.zeroth_time ? fmtDateTime(t.zeroth_time) : "—"}</span>
+                            </div>
                           </td>
                           {/* 1st candle — anchor (peak/trough) */}
                           <td style={{ padding:"10px 14px", textAlign:"right" }}>
