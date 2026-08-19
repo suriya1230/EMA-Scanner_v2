@@ -64,8 +64,11 @@ source of truth to keep in sync across restarts.
 """
 from __future__ import annotations
 
+import asyncio
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.database import AsyncSessionLocal
 from app.services.repository import CandleRepository
 
 TIMEFRAME = "1d"
@@ -74,7 +77,7 @@ TIMEFRAME = "1d"
 # `swing_threshold` param on both scan_swing_zones/scan_swing_backtest
 # (spec Rule 8: the threshold itself must be configurable/backtestable),
 # this module constant is just the default when nothing else is passed.
-SWING_THRESHOLD = 0.10
+SWING_THRESHOLD = 0.20
 # Default risk:reward — SL/TP distance from Z as a fraction. Both scan_swing_
 # zones and scan_swing_backtest accept sl_pct/tp_pct overrides (see the RR
 # presets exposed in app/api/swing_strategy.py: 1:2 5%/10%, 1:5 2%/10%,
@@ -82,7 +85,7 @@ SWING_THRESHOLD = 0.10
 # what's used when nothing else is passed.
 DEFAULT_TP_PCT = 0.10
 DEFAULT_SL_PCT = 0.05
-DEFAULT_MIN_VOLUME_USDT = 5_000_000.0
+DEFAULT_MIN_VOLUME_USDT = 10_000_000.0
 # An ARMED zone (confirmed but never retested) more than this many candles
 # (= days, at TIMEFRAME="1d") old expires — keeps the dashboard from
 # showing an unconfirmed setup that's sat untouched for months as if it
@@ -110,6 +113,18 @@ BACKTEST_REFINE_RECENT_DAYS = 60
 # the first, most precise tier without extra queries.
 REFINE_CASCADE_INTERVALS = ["5m", "15m", "30m", "1h"]
 DAY_MS = 86_400_000
+# Each zone/trade needs up to ~6 sequential intraday-refinement queries
+# (detected_at, triggered_at, resolved_at, anchor_time, candidate_time,
+# zeroth_time), and running them one zone at a time — awaiting each query
+# before starting the next — was the actual bottleneck (20-30s for a full
+# scan), not the detection logic itself (which is pure in-memory Python and
+# fast). scan_swing_zones/scan_swing_backtest now build every zone's row
+# independently (each on its own short-lived DB session so they don't
+# serialize on a single connection) and run them concurrently via
+# asyncio.gather, bounded by this semaphore. Kept below the connection
+# pool's pool_size (20, see app/db/database.py) so a full-concurrency scan
+# still leaves headroom for other requests hitting the same pool at once.
+REFINE_CONCURRENCY = 16
 
 
 def _make_zone(
@@ -447,6 +462,95 @@ def _resolution_predicate(sl: float, tp: float, direction: str, outcome: str):
     return (lambda row: row["low"] <= sl) if is_long else (lambda row: row["high"] >= sl)
 
 
+async def _build_zone_row(
+    symbol: str, direction: str, zone: dict, candles: list[dict],
+    price: float, latest_idx: int, market: str, swing_threshold: float,
+) -> dict:
+    """Builds one live-dashboard row for a single zone, including every
+    intraday-refinement query it needs — on its own short-lived DB session
+    so many of these can run truly concurrently (see scan_swing_zones)
+    instead of serializing one at a time on a single shared connection."""
+    async with AsyncSessionLocal() as db:
+        day_open_time = candles[zone["confirmed_at"]]["open_time"]
+        reference = zone["swing_extreme"]
+        # Only refine the confirmation moment when that day has already
+        # fully closed — if it confirmed off the still-forming latest
+        # candle (the same-day self-confirmation case), `reference` is
+        # itself only known because the day is aggregated so far, so
+        # checking it against that same day's earlier minutes/hours
+        # would be look-ahead bias (an early moment's high compared
+        # against a low that, in real time, hadn't happened yet).
+        # Falls back to the day's own open_time in that case. Entry
+        # touch and TP/SL resolution have no such circularity (Z/SL/TP
+        # are already fixed from an earlier day), so those always refine.
+        if zone["confirmed_at"] < latest_idx:
+            detected_at = await _refine_moment(db, symbol, market, day_open_time, _confirm_predicate(reference, direction, swing_threshold))
+        else:
+            detected_at = day_open_time
+
+        triggered_at = None
+        if zone["triggered_at"] is not None:
+            trig_day = candles[zone["triggered_at"]]["open_time"]
+            triggered_at = await _refine_moment(db, symbol, market, trig_day, _touch_predicate(zone["z"], direction))
+
+        resolved_at = None
+        if zone["resolved_at"] is not None and zone["state"] in ("TP_HIT", "SL_HIT"):
+            resolved_day = candles[zone["resolved_at"]]["open_time"]
+            resolved_at = await _refine_moment(
+                db, symbol, market, resolved_day,
+                _resolution_predicate(zone["sl"], zone["tp"], direction, zone["state"]),
+            )
+        elif zone["resolved_at"] is not None:
+            resolved_at = candles[zone["resolved_at"]]["open_time"]  # EXPIRED — no finer condition to refine against
+
+        # Anchor (diagram point 1) and candidate (point 2, the swing
+        # low/high itself) both sit on already-elapsed days relative to
+        # confirmation, so no look-ahead-bias concern refining either —
+        # unlike detected_at above, these always refine. For LONG the
+        # anchor is a peak (seeking its high) and the candidate is a
+        # trough (seeking its low); for SHORT it's the reverse.
+        anchor_day = candles[zone["anchor_at"]]["open_time"]
+        anchor_time = await _refine_extreme_moment(db, symbol, market, anchor_day, seeking_high=(direction == "LONG"))
+        candidate_day = candles[zone["candidate_at"]]["open_time"]
+        candidate_time = await _refine_extreme_moment(db, symbol, market, candidate_day, seeking_high=(direction == "SHORT"))
+
+        # "0 candle" (diagram point 0) — the prior extreme that
+        # validated this zone's own anchor. None for the very first
+        # zone ever detected for this coin (nothing before the start
+        # of stored history to validate against). Opposite seeking_high
+        # from this zone's own anchor, since it's the anchor of the
+        # OPPOSITE-direction zone that came immediately before it.
+        zeroth_time = None
+        if zone.get("zeroth_at") is not None:
+            zeroth_day = candles[zone["zeroth_at"]]["open_time"]
+            zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "state": zone["state"],
+        "zeroth_time": zeroth_time,       # diagram point 0 — the prior extreme validating the anchor
+        "zeroth_price": zone.get("zeroth_price"),
+        "anchor_time": anchor_time,      # diagram point 1 — the opposing extreme
+        "anchor_price": zone["anchor_price"],
+        "candidate_time": candidate_time,  # diagram point 2 — the swing low/high (Z's candle)
+        "confirm_price": zone["confirm_price"],  # diagram point 3's close (the confirming candle)
+        "entry_price": zone["z"],          # diagram point 4 — always exactly Z
+        "z": zone["z"],
+        "price": price,
+        "distance_pct": (price - zone["z"]) / zone["z"] * 100,
+        "sl": zone["sl"],
+        "tp": zone["tp"],
+        "confirm_move_pct": zone["confirm_move_pct"] * 100,
+        "zone_age": latest_idx - zone["confirmed_at"],
+        "detected_at": detected_at,   # ms epoch when ARMED (confirmed) — narrowed to the actual hour where possible
+        "triggered_at": triggered_at, # ms epoch when TRIGGERED (entry touch), or None if never touched
+        "resolved_at": resolved_at,   # ms epoch when TP_HIT/SL_HIT/EXPIRED, or None if still live
+        "body_ratio": zone["body_ratio"],
+        "swing_extreme": zone["swing_extreme"],
+    }
+
+
 async def scan_swing_zones(
     db: AsyncSession,
     market: str = "futures",
@@ -461,10 +565,13 @@ async def scan_swing_zones(
     IS the day's total, so no separate 24h lookback is needed) is >=
     min_volume_usdt, and returns one dashboard row per currently-live
     long/short zone, sorted by absolute distance to Z ascending (the
-    actionable watchlist first)."""
+    actionable watchlist first). Detection (pure in-memory Python, fast) and
+    the intraday-refinement DB queries (the actual slow part) are split into
+    two phases — every zone's refinement runs concurrently, bounded by
+    REFINE_CONCURRENCY, instead of one zone at a time."""
     candles_by_symbol = await CandleRepository.get_ohlc_by_symbol(db, interval=TIMEFRAME, market=market)
 
-    rows = []
+    pending = []
     symbols_scanned = 0
     for symbol, candles in candles_by_symbol.items():
         if len(candles) < 2:
@@ -482,85 +589,15 @@ async def scan_swing_zones(
             zone = live[direction]
             if zone is None:
                 continue
-            day_open_time = candles[zone["confirmed_at"]]["open_time"]
-            reference = zone["swing_extreme"]
-            # Only refine the confirmation moment when that day has already
-            # fully closed — if it confirmed off the still-forming latest
-            # candle (the same-day self-confirmation case), `reference` is
-            # itself only known because the day is aggregated so far, so
-            # checking it against that same day's earlier minutes/hours
-            # would be look-ahead bias (an early moment's high compared
-            # against a low that, in real time, hadn't happened yet).
-            # Falls back to the day's own open_time in that case. Entry
-            # touch and TP/SL resolution have no such circularity (Z/SL/TP
-            # are already fixed from an earlier day), so those always refine.
-            if zone["confirmed_at"] < latest_idx:
-                detected_at = await _refine_moment(db, symbol, market, day_open_time, _confirm_predicate(reference, direction, swing_threshold))
-            else:
-                detected_at = day_open_time
+            pending.append((symbol, direction, zone, candles, price, latest_idx))
 
-            triggered_at = None
-            if zone["triggered_at"] is not None:
-                trig_day = candles[zone["triggered_at"]]["open_time"]
-                triggered_at = await _refine_moment(db, symbol, market, trig_day, _touch_predicate(zone["z"], direction))
+    semaphore = asyncio.Semaphore(REFINE_CONCURRENCY)
 
-            resolved_at = None
-            if zone["resolved_at"] is not None and zone["state"] in ("TP_HIT", "SL_HIT"):
-                resolved_day = candles[zone["resolved_at"]]["open_time"]
-                resolved_at = await _refine_moment(
-                    db, symbol, market, resolved_day,
-                    _resolution_predicate(zone["sl"], zone["tp"], direction, zone["state"]),
-                )
-            elif zone["resolved_at"] is not None:
-                resolved_at = candles[zone["resolved_at"]]["open_time"]  # EXPIRED — no finer condition to refine against
+    async def _bounded(args):
+        async with semaphore:
+            return await _build_zone_row(*args, market=market, swing_threshold=swing_threshold)
 
-            # Anchor (diagram point 1) and candidate (point 2, the swing
-            # low/high itself) both sit on already-elapsed days relative to
-            # confirmation, so no look-ahead-bias concern refining either —
-            # unlike detected_at above, these always refine. For LONG the
-            # anchor is a peak (seeking its high) and the candidate is a
-            # trough (seeking its low); for SHORT it's the reverse.
-            anchor_day = candles[zone["anchor_at"]]["open_time"]
-            anchor_time = await _refine_extreme_moment(db, symbol, market, anchor_day, seeking_high=(direction == "LONG"))
-            candidate_day = candles[zone["candidate_at"]]["open_time"]
-            candidate_time = await _refine_extreme_moment(db, symbol, market, candidate_day, seeking_high=(direction == "SHORT"))
-
-            # "0 candle" (diagram point 0) — the prior extreme that
-            # validated this zone's own anchor. None for the very first
-            # zone ever detected for this coin (nothing before the start
-            # of stored history to validate against). Opposite seeking_high
-            # from this zone's own anchor, since it's the anchor of the
-            # OPPOSITE-direction zone that came immediately before it.
-            zeroth_time = None
-            if zone.get("zeroth_at") is not None:
-                zeroth_day = candles[zone["zeroth_at"]]["open_time"]
-                zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
-
-            rows.append({
-                "symbol": symbol,
-                "direction": direction,
-                "state": zone["state"],
-                "zeroth_time": zeroth_time,       # diagram point 0 — the prior extreme validating the anchor
-                "zeroth_price": zone.get("zeroth_price"),
-                "anchor_time": anchor_time,      # diagram point 1 — the opposing extreme
-                "anchor_price": zone["anchor_price"],
-                "candidate_time": candidate_time,  # diagram point 2 — the swing low/high (Z's candle)
-                "confirm_price": zone["confirm_price"],  # diagram point 3's close (the confirming candle)
-                "entry_price": zone["z"],          # diagram point 4 — always exactly Z
-                "z": zone["z"],
-                "price": price,
-                "distance_pct": (price - zone["z"]) / zone["z"] * 100,
-                "sl": zone["sl"],
-                "tp": zone["tp"],
-                "confirm_move_pct": zone["confirm_move_pct"] * 100,
-                "zone_age": latest_idx - zone["confirmed_at"],
-                "detected_at": detected_at,   # ms epoch when ARMED (confirmed) — narrowed to the actual hour where possible
-                "triggered_at": triggered_at, # ms epoch when TRIGGERED (entry touch), or None if never touched
-                "resolved_at": resolved_at,   # ms epoch when TP_HIT/SL_HIT/EXPIRED, or None if still live
-                "body_ratio": zone["body_ratio"],
-                "swing_extreme": zone["swing_extreme"],
-            })
-
+    rows = list(await asyncio.gather(*(_bounded(item) for item in pending)))
     rows.sort(key=lambda r: abs(r["distance_pct"]))
 
     return {
@@ -572,6 +609,98 @@ async def scan_swing_zones(
         "sl_pct": sl_pct,
         "symbols_scanned": symbols_scanned,
         "zones": rows,
+    }
+
+
+async def _build_trade(
+    symbol: str, zone: dict, candles: list[dict], latest_idx: int,
+    market: str, tp_pct: float, sl_pct: float, swing_threshold: float,
+) -> dict:
+    """Builds one backtest trade row, including its intraday-refinement
+    queries when it's recent enough to warrant them — on its own
+    short-lived DB session (only opened when actually needed) so many of
+    these can run concurrently (see scan_swing_backtest)."""
+    direction = zone["direction"]
+    if zone["state"] == "TP_HIT":
+        result, exit_price, gain_pct = "WIN", zone["tp"], tp_pct * 100
+    elif zone["state"] == "SL_HIT":
+        result, exit_price, gain_pct = "LOSS", zone["sl"], -sl_pct * 100
+    else:  # still TRIGGERED, unresolved
+        result, exit_price, gain_pct = "OPEN", None, None
+
+    # Same intraday refinement as the live dashboard (see scan_swing_zones),
+    # but only for recent trades — refining all of them was the original
+    # bottleneck. Older trades keep the coarser day-level timestamp (still
+    # the correct day, just not the exact minute) and skip DB work entirely.
+    is_recent = (latest_idx - zone["triggered_at"]) <= BACKTEST_REFINE_RECENT_DAYS
+    entry_day = candles[zone["triggered_at"]]["open_time"]
+    confirm_day = candles[zone["confirmed_at"]]["open_time"]
+    reference = zone["swing_extreme"]
+    zeroth_price = zone.get("zeroth_price")
+
+    if not is_recent:
+        entry_time = entry_day
+        exit_time = (
+            candles[zone["resolved_at"]]["open_time"] if zone["resolved_at"] is not None else None
+        )
+        detected_at = confirm_day
+        anchor_time = candles[zone["anchor_at"]]["open_time"]
+        candidate_time = candles[zone["candidate_at"]]["open_time"]
+        zeroth_time = (
+            candles[zone["zeroth_at"]]["open_time"] if zone.get("zeroth_at") is not None else None
+        )
+    else:
+        async with AsyncSessionLocal() as db:
+            entry_time = await _refine_moment(db, symbol, market, entry_day, _touch_predicate(zone["z"], direction))
+
+            if zone["resolved_at"] is not None and zone["state"] in ("TP_HIT", "SL_HIT"):
+                exit_day = candles[zone["resolved_at"]]["open_time"]
+                exit_time = await _refine_moment(
+                    db, symbol, market, exit_day,
+                    _resolution_predicate(zone["sl"], zone["tp"], direction, zone["state"]),
+                )
+            elif zone["resolved_at"] is not None:
+                exit_time = candles[zone["resolved_at"]]["open_time"]  # EXPIRED — no finer condition to refine against
+            else:
+                exit_time = None
+
+            # "0 candle" (diagram point 0) — same derivation as the live
+            # dashboard. None for a coin's very first zone ever (no prior
+            # extreme exists before the start of stored history).
+            zeroth_time = None
+            if zone.get("zeroth_at") is not None:
+                zeroth_day = candles[zone["zeroth_at"]]["open_time"]
+                zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
+
+            # Same 4-point timeline as the live dashboard (see
+            # scan_swing_zones): anchor (point 1), candidate/Z (point 2),
+            # confirmation (point 3).
+            detected_at = await _refine_moment(db, symbol, market, confirm_day, _confirm_predicate(reference, direction, swing_threshold))
+            anchor_day = candles[zone["anchor_at"]]["open_time"]
+            anchor_time = await _refine_extreme_moment(db, symbol, market, anchor_day, seeking_high=(direction == "LONG"))
+            candidate_day = candles[zone["candidate_at"]]["open_time"]
+            candidate_time = await _refine_extreme_moment(db, symbol, market, candidate_day, seeking_high=(direction == "SHORT"))
+
+    return {
+        "symbol": symbol,
+        "direction": direction,
+        "z": zone["z"],
+        "sl": zone["sl"],
+        "tp": zone["tp"],
+        "zeroth_time": zeroth_time,
+        "zeroth_price": zeroth_price,
+        "anchor_time": anchor_time,
+        "anchor_price": zone["anchor_price"],
+        "candidate_time": candidate_time,
+        "detected_at": detected_at,
+        "confirm_price": zone["confirm_price"],
+        "entry_time": entry_time,
+        "exit_time": exit_time,
+        "entry_price": zone["z"],
+        "exit_price": exit_price,
+        "result": result,
+        "duration_ms": (exit_time - entry_time) if exit_time is not None else None,
+        "gain_pct": gain_pct,
     }
 
 
@@ -593,10 +722,13 @@ async def scan_swing_backtest(
     SL (this strategy has no slippage/partial-fill concept), so every
     WIN/LOSS has the identical fixed PnL% (+tp_pct / -sl_pct) — only which
     coin and when differ. Sorted oldest entry first, matching a backtest
-    trade log rather than the live dashboard's distance-to-Z ordering."""
+    trade log rather than the live dashboard's distance-to-Z ordering.
+    Detection (fast, in-memory) and refinement (the slow DB-bound part) are
+    split into two phases the same way as scan_swing_zones — every trade's
+    refinement runs concurrently, bounded by REFINE_CONCURRENCY."""
     candles_by_symbol = await CandleRepository.get_ohlc_by_symbol(db, interval=TIMEFRAME, market=market)
 
-    trades = []
+    pending = []
     symbols_scanned = 0
     for symbol, candles in candles_by_symbol.items():
         if len(candles) < 2:
@@ -611,93 +743,15 @@ async def scan_swing_backtest(
         for zone in _run_chain_history(candles, max_zone_age, sl_pct, tp_pct, swing_threshold):
             if zone["triggered_at"] is None:
                 continue  # never retested/entered — not a trade
-            direction = zone["direction"]
-            if zone["state"] == "TP_HIT":
-                result, exit_price, gain_pct = "WIN", zone["tp"], tp_pct * 100
-            elif zone["state"] == "SL_HIT":
-                result, exit_price, gain_pct = "LOSS", zone["sl"], -sl_pct * 100
-            else:  # still TRIGGERED, unresolved
-                result, exit_price, gain_pct = "OPEN", None, None
+            pending.append((symbol, zone, candles, latest_idx))
 
-            # Same intraday refinement as the live dashboard (see
-            # scan_swing_zones), but only for recent trades — refining all
-            # of them (2+ extra DB queries each) was turning a full
-            # backtest scan into ~35s. Older trades keep the coarser
-            # day-level timestamp (still the correct day, just not the
-            # exact minute).
-            is_recent = (latest_idx - zone["triggered_at"]) <= BACKTEST_REFINE_RECENT_DAYS
-            entry_day = candles[zone["triggered_at"]]["open_time"]
-            if is_recent:
-                entry_time = await _refine_moment(db, symbol, market, entry_day, _touch_predicate(zone["z"], direction))
-            else:
-                entry_time = entry_day
+    semaphore = asyncio.Semaphore(REFINE_CONCURRENCY)
 
-            if zone["resolved_at"] is not None and zone["state"] in ("TP_HIT", "SL_HIT"):
-                exit_day = candles[zone["resolved_at"]]["open_time"]
-                if is_recent:
-                    exit_time = await _refine_moment(
-                        db, symbol, market, exit_day,
-                        _resolution_predicate(zone["sl"], zone["tp"], direction, zone["state"]),
-                    )
-                else:
-                    exit_time = exit_day
-            elif zone["resolved_at"] is not None:
-                exit_time = candles[zone["resolved_at"]]["open_time"]  # EXPIRED — no finer condition to refine against
-            else:
-                exit_time = None
+    async def _bounded(args):
+        async with semaphore:
+            return await _build_trade(*args, market=market, tp_pct=tp_pct, sl_pct=sl_pct, swing_threshold=swing_threshold)
 
-            # Same 4-point timeline as the live dashboard (see
-            # scan_swing_zones): anchor (point 1), candidate/Z (point 2),
-            # confirmation (point 3). Gated by the same is_recent flag as
-            # entry/exit above, for the same performance reason.
-            confirm_day = candles[zone["confirmed_at"]]["open_time"]
-            reference = zone["swing_extreme"]
-            # "0 candle" (diagram point 0) — same derivation as the live
-            # dashboard, also gated by is_recent for the same performance
-            # reason. None for a coin's very first zone ever (no prior
-            # extreme exists before the start of stored history).
-            zeroth_price = zone.get("zeroth_price")
-            zeroth_time = None
-            if zone.get("zeroth_at") is not None:
-                zeroth_day = candles[zone["zeroth_at"]]["open_time"]
-                if is_recent:
-                    zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
-                else:
-                    zeroth_time = zeroth_day
-
-            if is_recent:
-                detected_at = await _refine_moment(db, symbol, market, confirm_day, _confirm_predicate(reference, direction, swing_threshold))
-                anchor_day = candles[zone["anchor_at"]]["open_time"]
-                anchor_time = await _refine_extreme_moment(db, symbol, market, anchor_day, seeking_high=(direction == "LONG"))
-                candidate_day = candles[zone["candidate_at"]]["open_time"]
-                candidate_time = await _refine_extreme_moment(db, symbol, market, candidate_day, seeking_high=(direction == "SHORT"))
-            else:
-                detected_at = confirm_day
-                anchor_time = candles[zone["anchor_at"]]["open_time"]
-                candidate_time = candles[zone["candidate_at"]]["open_time"]
-
-            trades.append({
-                "symbol": symbol,
-                "direction": direction,
-                "z": zone["z"],
-                "sl": zone["sl"],
-                "tp": zone["tp"],
-                "zeroth_time": zeroth_time,
-                "zeroth_price": zeroth_price,
-                "anchor_time": anchor_time,
-                "anchor_price": zone["anchor_price"],
-                "candidate_time": candidate_time,
-                "detected_at": detected_at,
-                "confirm_price": zone["confirm_price"],
-                "entry_time": entry_time,
-                "exit_time": exit_time,
-                "entry_price": zone["z"],
-                "exit_price": exit_price,
-                "result": result,
-                "duration_ms": (exit_time - entry_time) if exit_time is not None else None,
-                "gain_pct": gain_pct,
-            })
-
+    trades = list(await asyncio.gather(*(_bounded(item) for item in pending)))
     trades.sort(key=lambda t: t["entry_time"])
 
     return {

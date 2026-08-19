@@ -2547,7 +2547,7 @@ function SwingStrategyPage({ onHome, onBacktest }) {
         <div style={{ margin:"0 24px 16px", padding:24, textAlign:"center", color:"#dc2626", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>⚠ {error}</div>
       ) : zones.length === 0 ? (
         <div style={{ margin:"0 24px 16px", padding:60, textAlign:"center", color:"#9ca3af", fontSize:13, background:"#fff", borderRadius:14, border:"1px solid #e5e7eb" }}>
-          No live zones right now — needs coins with stored 1d candles and 24h volume ≥ ${((data?.min_volume_usdt ?? 5_000_000)/1e6).toFixed(0)}M.
+          No live zones right now — needs coins with stored 1d candles and 24h volume ≥ ${((data?.min_volume_usdt ?? 10_000_000)/1e6).toFixed(0)}M.
         </div>
       ) : (
         <>
