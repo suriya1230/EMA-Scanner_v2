@@ -34,7 +34,7 @@ router = APIRouter(prefix="/api", tags=["swing-strategy"])
 # sl_pct/tp_pct/swing_threshold are accepted as whole percent values (e.g. 5
 # means 5%), not fractions, then divided by 100 before reaching the service
 # layer — the RR preset buttons on the frontend (1:2 5%/10%, 1:5 2%/10%)
-# send sl_pct/tp_pct directly; swing_threshold defaults to 20%.
+# send sl_pct/tp_pct directly; swing_threshold defaults to 10%.
 
 
 @router.get("/swing-zones")

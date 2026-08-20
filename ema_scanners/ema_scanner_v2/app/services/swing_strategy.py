@@ -77,7 +77,7 @@ TIMEFRAME = "1d"
 # `swing_threshold` param on both scan_swing_zones/scan_swing_backtest
 # (spec Rule 8: the threshold itself must be configurable/backtestable),
 # this module constant is just the default when nothing else is passed.
-SWING_THRESHOLD = 0.20
+SWING_THRESHOLD = 0.10
 # Default risk:reward — SL/TP distance from Z as a fraction. Both scan_swing_
 # zones and scan_swing_backtest accept sl_pct/tp_pct overrides (see the RR
 # presets exposed in app/api/swing_strategy.py: 1:2 5%/10%, 1:5 2%/10%,
