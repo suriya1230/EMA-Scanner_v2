@@ -77,11 +77,12 @@ BUY side:
   4. This is the ONLY Z this anchor will ever produce — no further
      candidate search runs from this anchor, no matter what price does
      afterward. Entry is the first later candle whose CLOSE touches Z
-     (not a wick — same close-based rule as every other stage), however
-     many candles/days that takes, UNLESS the zone expires first (an
-     ARMED zone unretested for more than max_zone_age candles/days
-     expires — see DEFAULT_MAX_ZONE_AGE). SL = Z - 5%, TP = Z + 10% (both
-     configurable), also CLOSE-based, checked the same way.
+     (not a wick — same close-based rule as every other stage, SL/TP are
+     the only wick-based check in the whole file), however many
+     candles/days that takes, UNLESS the zone expires first (an ARMED
+     zone unretested for more than max_zone_age candles/days expires —
+     see DEFAULT_MAX_ZONE_AGE). SL = Z - 5%, TP = Z + 10% (both
+     configurable), checked via wick.
   5. Once this zone fully RESOLVES (TP/SL/expiry), the search goes back
      to a fresh 0-candle search (step 1), forgetting every pivot tracked
      during the just-finished cycle.
@@ -101,8 +102,8 @@ once this cycle resolves.
 So every swing point needs THREE qualifying legs, ALL close-based: 0
 candle -> candle 1, candle 1 -> Z (checked via "primed"), and Z ->
 confirming candle — each independently >= SWING_THRESHOLD. Pivot
-detection (the 0 candle itself), entry, and SL/TP resolution are all
-close-based too — nothing in this module is wick-based any more.
+detection (the 0 candle itself) is also close-based. SL and TP are the
+only wick-based checks anywhere in this module.
 
 A later candle can never extend/confirm a point off itself in the same
 iteration that just created it (same-day exclusion / anti-look-ahead) —
@@ -111,8 +112,8 @@ enforced by `continue`-ing immediately after any such update.
 LONG and SHORT each keep their own independent live trade AND their own
 independent detection search — a coin can hold one live position of each
 side at once, confirming completely on its own schedule. Both keep
-advancing (entry touch, then stop and target — all three close-based)
-every subsequent candle.
+advancing (close-based entry touch, then wick-based stop and wick-based
+target) every subsequent candle.
 
 Detection is fully mechanical, replayed from the complete stored candle
 history on every call rather than maintained as separately-persisted
@@ -200,8 +201,8 @@ def _make_zone(
 ) -> dict:
     is_long = pivot_type == "low"
     # Zone level Z = the candidate candle's own CLOSE — every stage of
-    # detection AND resolution (pivots, both legs, Z itself, entry, SL/TP)
-    # is close-based; nothing in this module checks a wick. This is the
+    # detection (pivots, both legs, Z itself, entry) is close-based; only
+    # SL/TP resolution stays wick-based (see _advance_zone). This is the
     # same value as "swing_extreme" below; the two fields are kept
     # separate in the output because "swing_extreme" is documented/
     # displayed as a distinct reference column, even though they're now
@@ -230,9 +231,10 @@ def _make_zone(
 
 def _advance_zone(zone: dict | None, c: dict, idx: int, max_zone_age: int | None) -> None:
     """Advances one live trade (LONG or SHORT, mutated in place) using this
-    candle — entry touch AND SL/TP resolution are all CLOSE-based now (a
-    candle's close trading at/past the level, not just an intrabar wick).
-    No-op if there's no zone or it's already resolved."""
+    candle — entry touch is CLOSE-based (a candle's close trading at/past Z,
+    not just an intrabar wick), but SL/TP resolution stays WICK-based (an
+    intrabar "price trades at/below the stop level" touch, not a candle
+    close). No-op if there's no zone or it's already resolved."""
     if zone is None or zone["state"] not in LIVE_STATES:
         return
     is_long = zone["direction"] == "LONG"
@@ -243,25 +245,25 @@ def _advance_zone(zone: dict | None, c: dict, idx: int, max_zone_age: int | None
             zone["state"] = "TRIGGERED"
             zone["triggered_at"] = idx
         if zone["state"] == "TRIGGERED":
-            if c["close"] <= sl:
+            if c["low"] <= sl:
                 zone["state"] = "SL_HIT"
                 zone["resolved_at"] = idx
-            elif c["close"] >= tp:
+            elif c["high"] >= tp:
                 zone["state"] = "TP_HIT"
                 zone["resolved_at"] = idx
-        # No ARMED-state SL/TP check here: entry is CLOSE-based, so a
-        # candle's close can never pass SL/TP without having already
-        # passed Z first (SL/TP sit further away than Z) — a zone that
-        # was never actually entered just stays ARMED and keeps waiting.
+        # No ARMED-state SL/TP check here: entry is now CLOSE-based, so a
+        # candle can wick through both Z and SL/TP without its close ever
+        # reaching Z — that's a zone that was never actually entered, not
+        # a stop-out, so it stays ARMED and keeps waiting.
     else:
         if zone["state"] == "ARMED" and c["close"] >= z:
             zone["state"] = "TRIGGERED"
             zone["triggered_at"] = idx
         if zone["state"] == "TRIGGERED":
-            if c["close"] >= sl:
+            if c["high"] >= sl:
                 zone["state"] = "SL_HIT"
                 zone["resolved_at"] = idx
-            elif c["close"] <= tp:
+            elif c["low"] <= tp:
                 zone["state"] = "TP_HIT"
                 zone["resolved_at"] = idx
 
@@ -296,8 +298,9 @@ def _run_chain_history(
 def _is_pivot_low(candles: list[dict], i: int, strength: int) -> bool:
     """True if candles[i]'s CLOSE is strictly lower than `strength` candles'
     closes on BOTH sides of it — a confirmed local swing low. Close-based,
-    like every other stage of detection and resolution in this module.
-    Caller must ensure i-strength >= 0 and i+strength < len(candles)."""
+    like every other stage of detection (SL/TP are the only wick-based
+    check in the whole file). Caller must ensure i-strength >= 0 and
+    i+strength < len(candles)."""
     for k in range(1, strength + 1):
         if candles[i]["close"] >= candles[i - k]["close"] or candles[i]["close"] >= candles[i + k]["close"]:
             return False
@@ -585,8 +588,8 @@ def _confirm_predicate(reference: float, direction: str, swing_threshold: float)
 
 
 def _touch_predicate(z: float, direction: str):
-    # Entry is CLOSE-based, same as every other stage in this module,
-    # including SL/TP resolution (see _resolution_predicate).
+    # Entry is CLOSE-based, same as every other detection stage (SL/TP
+    # resolution is the only wick-based check — see _resolution_predicate).
     if direction == "LONG":
         return lambda row: row["close"] <= z
     return lambda row: row["close"] >= z
@@ -612,12 +615,11 @@ def _resolution_predicate(sl: float, tp: float, direction: str, outcome: str):
     """Checks whichever condition matches the ALREADY-KNOWN 1d-level
     outcome (TP_HIT or SL_HIT) — not re-derived at finer granularity, so
     the refined moment can't disagree with the daily-level determination
-    of how the trade actually ended. Close-based, matching SL/TP
-    resolution everywhere else (see _advance_zone)."""
+    of how the trade actually ended."""
     is_long = direction == "LONG"
     if outcome == "TP_HIT":
-        return (lambda row: row["close"] >= tp) if is_long else (lambda row: row["close"] <= tp)
-    return (lambda row: row["close"] <= sl) if is_long else (lambda row: row["close"] >= sl)
+        return (lambda row: row["high"] >= tp) if is_long else (lambda row: row["low"] <= tp)
+    return (lambda row: row["low"] <= sl) if is_long else (lambda row: row["high"] >= sl)
 
 
 async def _build_zone_row(
