@@ -4,56 +4,116 @@ each coin's 1d candles, projects them forward as price zones, and reports
 which coins currently have a live (ARMED or TRIGGERED) LONG and/or SHORT
 zone near price.
 
-Detection is a SINGLE alternating state machine (matches the formal
-"Swing High & Low Strategy Specification" v1.0), not two independent
-long/short candidate searches — a confirmed swing low is always followed
-by tracking toward a swing high, then back to tracking a low, and so on:
+BUY (swing low) and SELL (swing high) are two FULLY INDEPENDENT searches
+over the same candle history — neither waits its turn on the other. Each
+is a chain of THREE points — "0 candle" -> "candle 1" (the anchor) ->
+"Z candle" (the candidate) — where each point is reached by chasing a
+running extreme away from the PREVIOUS point until the move between them
+clears SWING_THRESHOLD, exactly the same mechanical pattern applied
+twice in a row:
 
-  1. SEARCHING (bootstrap only, until the very first swing point exists):
-     track the running peak and running trough from the start of history;
-     whichever leg (fall from the running peak, or rise from the running
-     trough) reaches SWING_THRESHOLD first decides the initial direction
-     and fixes the opposite extreme as the anchor going forward.
+  - "0 candle": the highest CONFIRMED local swing-high pivot (SELL) /
+    lowest confirmed swing-low pivot (BUY) seen since the search last
+    reset — a pivot needs PIVOT_STRENGTH candles on both sides with
+    strictly lower highs / higher lows to confirm (same definition as
+    the frontend's own findRecentSwingLow/High helper). This is NOT
+    simply "whichever pivot is most recent" — a pivot that's WEAKER than
+    the one already tracked (a Lower High for SELL, a Higher Low for
+    BUY) is skipped entirely; the 0 candle only ever advances to a
+    pivot that's a genuine new Higher High / Lower Low. It keeps
+    advancing that way for as long as nothing downstream has CONFIRMED
+    yet (see below), then resets fresh (forgetting every prior pivot)
+    once a cycle resolves. A pivot only becomes recognizable
+    PIVOT_STRENGTH candles after it forms (once the confirming candles
+    on its right exist), so there's an inherent short recognition lag,
+    but no look-ahead relative to the candle currently being scanned.
+  - "candle 1" (anchor): starting from the current 0 candle, track the
+    running opposite extreme (a low for BUY, a high for SELL) forward,
+    extending to any new such extreme as it forms (Rule 4.1) — the
+    moment the move from the 0 candle into it first reaches
+    SWING_THRESHOLD, that point locks in as candle 1.
+  - "Z candle" (candidate): starting from candle 1, the exact same
+    chase runs again in the opposite direction (a high for BUY, a low
+    for SELL) until ITS move away from candle 1 first reaches
+    SWING_THRESHOLD ("PRIMED").
 
-  2. TRACKING_LOW: the anchor (a swing high — either the previous CONFIRMED
-     swing high, or the bootstrap peak) is FIXED; it does not move again
-     just because a new intraday peak appears while we're in this phase.
-     Track the running trough since the anchor as the CANDIDATE swing low
-     — each new lower low replaces the candidate (Rule 4.1). The candidate
-     only becomes eligible for confirmation ("PRIMED") once the fall from
-     the anchor down to it is ITSELF >= SWING_THRESHOLD — the anchor has
-     to be a genuine qualifying peak relative to this candidate, not just
-     whatever the most recent high happened to be. Once primed, the
-     moment a later candle's CLOSE (not wick — the recovery must actually
-     hold through the close, not just spike past it intrabar) recovers >=
-     SWING_THRESHOLD above the candidate's own low, the candidate is
-     CONFIRMED as a swing low: Z = candidate.low, a tradeable LONG zone
-     arms, and the state flips to TRACKING_HIGH with the anchor now fixed
-     at this candidate.
+Nothing in this chain is a fixed one-time value until a zone actually
+CONFIRMS off it: for as long as no zone has confirmed yet, EVERY new,
+MORE EXTREME 0 candle (a genuine Higher High for SELL, Lower Low for
+BUY — never a weaker Lower High / Higher Low) immediately restarts the
+whole 0->1->Z chase from scratch, discarding whatever not-yet-confirmed
+candle 1/Z progress existed against the old one — priming a candidate is
+only an ELIGIBILITY gate, not a freeze. Only once a zone actually
+CONFIRMS does the entire chain (0 candle, candle 1, Z) freeze permanently
+for the rest of this cycle.
 
-  3. TRACKING_HIGH: the mirror of the above — candidate = running peak,
-     primed once the rise from the anchor up to it is itself >=
-     SWING_THRESHOLD, confirmed by a later candle's CLOSE falling >=
-     SWING_THRESHOLD below the candidate's own high. A confirmed swing
-     high arms a tradeable SHORT zone (Z = candidate.high) the same way,
-     and flips the state back to TRACKING_LOW.
+BUY side:
+  1. The current 0 candle is the lowest confirmed pivot LOW seen since
+     the search last reset (a pivot that's merely more recent but HIGHER
+     than the current one — a Higher Low — is skipped entirely, not
+     used). A running high is chased forward from it (Rule 4.1): every
+     time this running high reaches a NEW record, re-check whether the
+     rise from the 0 candle into it clears SWING_THRESHOLD — if so,
+     (re-)lock candle 1 onto that new record, discarding any not-yet-
+     confirmed Z-candidate progress measured against whatever candle 1
+     used to be. This keeps happening for as long as NOTHING has actually
+     CONFIRMED yet (see step 3) — a coin that keeps making even lower
+     lows before ever confirming a reversal doesn't get stuck on the
+     first, shallower one just because it happened to prime first (the
+     exact same rule the 0 candle itself follows one level up).
+  2. From whatever candle 1 currently is, a running low is chased forward
+     the same way; the moment the fall from candle 1 into it first
+     reaches SWING_THRESHOLD, it's "PRIMED" as the Z candle. Priming is
+     only an eligibility gate — it does NOT freeze anything (see step 1):
+     an even lower pivot low, OR an even higher high forming off the
+     current 0 candle, can still re-lock candle 1 and restart the Z
+     search from scratch right up until step 3 actually confirms.
+  3. Once primed, the moment a later candle's CLOSE (not wick — the
+     recovery must actually hold through the close, not just spike past
+     it intrabar) recovers >= SWING_THRESHOLD above the candidate's own
+     low, it's CONFIRMED: Z = candidate.low, a tradeable LONG zone arms —
+     and only NOW does the entire chain (0 candle, candle 1, Z) freeze
+     permanently for the rest of this cycle.
+  4. This is the ONLY Z this anchor will ever produce — no further
+     candidate search runs from this anchor, no matter what price does
+     afterward. Entry is the first later candle whose CLOSE touches Z
+     (not a wick — same close-based rule as every other stage, SL/TP are
+     the only wick-based check in the whole file), however many
+     candles/days that takes, UNLESS the zone expires first (an ARMED
+     zone unretested for more than max_zone_age candles/days expires —
+     see DEFAULT_MAX_ZONE_AGE). SL = Z - 5%, TP = Z + 10% (both
+     configurable), checked via wick.
+  5. Once this zone fully RESOLVES (TP/SL/expiry), the search goes back
+     to a fresh 0-candle search (step 1), forgetting every pivot tracked
+     during the just-finished cycle.
 
-So every swing point needs THREE qualifying legs, not two: the move INTO
-the candidate (anchor -> candidate, checked via "primed"), and the move
-OUT of it that confirms the reversal (candidate -> confirming candle) —
-both independently >= SWING_THRESHOLD.
+SELL side is the exact mirror: 0 candle = the HIGHEST confirmed pivot
+high seen since the search last reset (skipping any merely-more-recent
+Lower High), candle 1 = a running low chased from it until the drop
+clears SWING_THRESHOLD, Z = a running high chased from candle 1 until
+the rise clears SWING_THRESHOLD ("PRIMED" — still just an eligibility
+gate, not a freeze; an even higher pivot high can still restart
+everything up until confirmation), confirms via a later CLOSE falling
+>= SWING_THRESHOLD below Z — which is what freezes the entire chain —
+Z = candidate.close, entry = a later candle's CLOSE touching Z, however
+long that takes, SL = Z + 5%, TP = Z - 10%, then a fresh 0-candle search
+once this cycle resolves.
 
-A later candle can never confirm a candidate off itself in the same
-iteration that just extended it (same-day exclusion / anti-look-ahead) —
-enforced by `continue`-ing immediately after a candidate update.
+So every swing point needs THREE qualifying legs, ALL close-based: 0
+candle -> candle 1, candle 1 -> Z (checked via "primed"), and Z ->
+confirming candle — each independently >= SWING_THRESHOLD. Pivot
+detection (the 0 candle itself) is also close-based. SL and TP are the
+only wick-based checks anywhere in this module.
 
-LONG and SHORT each keep their own independent live trade — confirming a
-new swing low only replaces the LONG trade, confirming a new swing high
-only replaces the SHORT trade, so a coin can hold one live position of
-each side at once even though detection itself is a single alternating
-chain. Both keep advancing (entry touch, then wick-based stop and
-wick-based target — an intrabar touch, not a candle close) every
-subsequent candle regardless of which tracking phase the detector is in.
+A later candle can never extend/confirm a point off itself in the same
+iteration that just created it (same-day exclusion / anti-look-ahead) —
+enforced by `continue`-ing immediately after any such update.
+
+LONG and SHORT each keep their own independent live trade AND their own
+independent detection search — a coin can hold one live position of each
+side at once, confirming completely on its own schedule. Both keep
+advancing (close-based entry touch, then wick-based stop and wick-based
+target) every subsequent candle.
 
 Detection is fully mechanical, replayed from the complete stored candle
 history on every call rather than maintained as separately-persisted
@@ -88,11 +148,18 @@ DEFAULT_SL_PCT = 0.05
 DEFAULT_MIN_VOLUME_USDT = 10_000_000.0
 # An ARMED zone (confirmed but never retested) more than this many candles
 # (= days, at TIMEFRAME="1d") old expires — keeps the dashboard from
-# showing an unconfirmed setup that's sat untouched for months as if it
-# were still a fresh, actionable watch item. Only affects ARMED zones —
-# an already-TRIGGERED (open) trade has no age cap, and a resolved
-# TP_HIT/SL_HIT is unaffected either way.
-DEFAULT_MAX_ZONE_AGE = 30
+# showing a setup that's sat untouched for months as if it were still a
+# fresh, actionable watch item. Only affects ARMED zones — an already-
+# TRIGGERED (open) trade has no age cap, and a resolved TP_HIT/SL_HIT is
+# unaffected either way. Overridable per-request via the API's
+# `max_zone_age` query param (ge=0, "0 disables").
+DEFAULT_MAX_ZONE_AGE = 60
+# Candles required on BOTH sides of a swing high/low for it to count as a
+# confirmed local pivot ("0 candle") — same definition/default as the
+# frontend's own findRecentSwingLow/High helper (app/page.js), so a pivot
+# only becomes recognizable this many candles after it actually forms
+# (once the confirming candles on its right exist).
+PIVOT_STRENGTH = 2
 LIVE_STATES = ("ARMED", "TRIGGERED")
 DIRECTIONS = ("LONG", "SHORT")
 # The backtest can carry thousands of historical trades — intraday-refining
@@ -133,12 +200,14 @@ def _make_zone(
     sl_pct: float, tp_pct: float,
 ) -> dict:
     is_long = pivot_type == "low"
-    # Zone level Z = the candidate candle's own extreme (its low for a BUY
-    # zone, its high for a SELL zone) — not its close. This is the same
-    # value as "swing_extreme" below; the two fields are kept separate in
-    # the output because "swing_extreme" is documented/displayed as a
-    # distinct reference column, even though they're now numerically equal.
-    z = extreme["low"] if is_long else extreme["high"]
+    # Zone level Z = the candidate candle's own CLOSE — every stage of
+    # detection (pivots, both legs, Z itself, entry) is close-based; only
+    # SL/TP resolution stays wick-based (see _advance_zone). This is the
+    # same value as "swing_extreme" below; the two fields are kept
+    # separate in the output because "swing_extreme" is documented/
+    # displayed as a distinct reference column, even though they're now
+    # numerically equal.
+    z = extreme["close"]
     rng = extreme["high"] - extreme["low"]
     body_ratio = abs(extreme["close"] - extreme["open"]) / rng if rng else 0.0
     return {
@@ -152,7 +221,7 @@ def _make_zone(
         "confirm_price": confirm_price,  # the confirming candle's own close
         "body_ratio": body_ratio,
         "anchor_at": anchor_idx,          # candle index of the opposing extreme (diagram point 1)
-        "anchor_price": anchor["high"] if is_long else anchor["low"],
+        "anchor_price": anchor["close"],
         "candidate_at": extreme_idx,      # candle index of the swing low/high itself (diagram point 2)
         "confirmed_at": idx,              # candle index of the confirming candle (diagram point 3)
         "triggered_at": None,             # candle index of the entry touch (diagram point 4)
@@ -162,7 +231,8 @@ def _make_zone(
 
 def _advance_zone(zone: dict | None, c: dict, idx: int, max_zone_age: int | None) -> None:
     """Advances one live trade (LONG or SHORT, mutated in place) using this
-    candle — entry touch, then wick-based stop and wick-based target (an
+    candle — entry touch is CLOSE-based (a candle's close trading at/past Z,
+    not just an intrabar wick), but SL/TP resolution stays WICK-based (an
     intrabar "price trades at/below the stop level" touch, not a candle
     close). No-op if there's no zone or it's already resolved."""
     if zone is None or zone["state"] not in LIVE_STATES:
@@ -171,7 +241,7 @@ def _advance_zone(zone: dict | None, c: dict, idx: int, max_zone_age: int | None
     z, sl, tp = zone["z"], zone["sl"], zone["tp"]
 
     if is_long:
-        if zone["state"] == "ARMED" and c["low"] <= z:
+        if zone["state"] == "ARMED" and c["close"] <= z:
             zone["state"] = "TRIGGERED"
             zone["triggered_at"] = idx
         if zone["state"] == "TRIGGERED":
@@ -181,11 +251,12 @@ def _advance_zone(zone: dict | None, c: dict, idx: int, max_zone_age: int | None
             elif c["high"] >= tp:
                 zone["state"] = "TP_HIT"
                 zone["resolved_at"] = idx
-        elif zone["state"] == "ARMED" and c["low"] <= sl:  # never touched — unreachable in practice (sl < z, so low > z already implies low > sl), kept for symmetry
-            zone["state"] = "SL_HIT"
-            zone["resolved_at"] = idx
+        # No ARMED-state SL/TP check here: entry is now CLOSE-based, so a
+        # candle can wick through both Z and SL/TP without its close ever
+        # reaching Z — that's a zone that was never actually entered, not
+        # a stop-out, so it stays ARMED and keeps waiting.
     else:
-        if zone["state"] == "ARMED" and c["high"] >= z:
+        if zone["state"] == "ARMED" and c["close"] >= z:
             zone["state"] = "TRIGGERED"
             zone["triggered_at"] = idx
         if zone["state"] == "TRIGGERED":
@@ -195,9 +266,6 @@ def _advance_zone(zone: dict | None, c: dict, idx: int, max_zone_age: int | None
             elif c["low"] <= tp:
                 zone["state"] = "TP_HIT"
                 zone["resolved_at"] = idx
-        elif zone["state"] == "ARMED" and c["high"] >= sl:  # unreachable in practice, mirrors the LONG side above
-            zone["state"] = "SL_HIT"
-            zone["resolved_at"] = idx
 
     if (
         zone["state"] == "ARMED" and max_zone_age is not None
@@ -212,158 +280,247 @@ def _run_chain_history(
     sl_pct: float = DEFAULT_SL_PCT, tp_pct: float = DEFAULT_TP_PCT,
     swing_threshold: float = SWING_THRESHOLD,
 ) -> list[dict]:
-    """Replays one coin's full candle history once as a SINGLE alternating
-    low/high chain and returns EVERY zone ever confirmed on EITHER side (not
-    just the current live ones) — each dict's "state" reflects wherever its
-    lifecycle actually ended up (TP_HIT, SL_HIT, EXPIRED, or still
-    ARMED/TRIGGERED if it's the side's last one and still live). LONG and
-    SHORT each track their own independent live trade even though the
-    underlying swing-point detection is a single alternating chain — see
-    module docstring for the full state-machine rules."""
+    """Replays one coin's full candle history and returns EVERY zone ever
+    confirmed on EITHER side (not just the current live ones) — each dict's
+    "state" reflects wherever its lifecycle actually ended up (TP_HIT,
+    SL_HIT, EXPIRED, or still ARMED/TRIGGERED if it's the side's last one
+    and still live). LONG and SHORT are two FULLY INDEPENDENT searches, not
+    a single alternating chain — see module docstring for the full rules."""
     n = len(candles)
     if n < 2:
         return []
 
-    mode: str | None = None  # None (bootstrap) | "tracking_low" | "tracking_high"
-    boot_peak, boot_peak_idx = candles[0], 0
-    boot_trough, boot_trough_idx = candles[0], 0
-    anchor: dict | None = None
-    anchor_idx: int | None = None
-    candidate: dict | None = None
-    candidate_idx: int | None = None
-    primed = False  # has the leg INTO the current candidate reached swing_threshold?
-    long_zone: dict | None = None
-    short_zone: dict | None = None
-    history: list[dict] = []
+    long_zones = _run_side_history(candles, True, max_zone_age, sl_pct, tp_pct, swing_threshold)
+    short_zones = _run_side_history(candles, False, max_zone_age, sl_pct, tp_pct, swing_threshold)
+    return long_zones + short_zones
 
-    def leg_into_candidate_pct() -> float:
-        # % move from the fixed anchor into the current candidate — the
-        # candidate only becomes eligible for confirmation once this leg
-        # ITSELF is >= swing_threshold (the anchor must be a genuine
-        # qualifying peak/trough relative to this candidate, not just
-        # whatever the most recent extreme happened to be).
-        if mode == "tracking_low":
-            ref = anchor["high"]
-            return (ref - candidate["low"]) / ref if ref else 0.0
-        ref = anchor["low"]
-        return (candidate["high"] - ref) / ref if ref else 0.0
+
+def _is_pivot_low(candles: list[dict], i: int, strength: int) -> bool:
+    """True if candles[i]'s CLOSE is strictly lower than `strength` candles'
+    closes on BOTH sides of it — a confirmed local swing low. Close-based,
+    like every other stage of detection (SL/TP are the only wick-based
+    check in the whole file). Caller must ensure i-strength >= 0 and
+    i+strength < len(candles)."""
+    for k in range(1, strength + 1):
+        if candles[i]["close"] >= candles[i - k]["close"] or candles[i]["close"] >= candles[i + k]["close"]:
+            return False
+    return True
+
+
+def _is_pivot_high(candles: list[dict], i: int, strength: int) -> bool:
+    """Mirror of _is_pivot_low for swing highs."""
+    for k in range(1, strength + 1):
+        if candles[i]["close"] <= candles[i - k]["close"] or candles[i]["close"] <= candles[i + k]["close"]:
+            return False
+    return True
+
+
+def _run_side_history(
+    candles: list[dict], is_long: bool, max_zone_age: int | None,
+    sl_pct: float, tp_pct: float, swing_threshold: float,
+) -> list[dict]:
+    """Runs ONE direction's search independently of the other — BUY and
+    SELL don't alternate or wait on each other. Each is a 3-point chain —
+    0 candle -> candle 1 (anchor) -> Z candle (candidate) — where each
+    point is reached by chasing a running extreme away from the previous
+    one, extending to any new such extreme (Rule 4.1), until the move
+    between them clears swing_threshold (the exact same mechanical
+    pattern run twice: 0->1, then 1->Z). The 0 candle is the highest
+    CONFIRMED local swing-high pivot (SELL) / lowest confirmed swing-low
+    pivot (BUY) seen since the search last reset (see _is_pivot_low/High)
+    — NOT simply whichever pivot is most recent: a pivot that's WEAKER
+    than the one already tracked (a Lower High for SELL, a Higher Low for
+    BUY) is skipped entirely. Candle 1 follows the exact same "keep
+    re-basing until confirmed" rule one level down: every time the
+    running extreme chased from the 0 candle reaches a new record, it
+    re-checks whether the leg into it clears swing_threshold and, if so,
+    (re-)locks candle 1 onto that new record — for as long as no zone has
+    actually CONFIRMED yet, either a fresher 0 candle OR a deeper/higher
+    candle-1 candidate off the SAME 0 candle immediately restarts the Z
+    search from scratch, discarding whatever not-yet-confirmed progress
+    existed (priming is only an ELIGIBILITY gate at both stages, never a
+    freeze). Only once a zone actually CONFIRMS does the entire chain
+    (0 candle, candle 1, Z) freeze permanently, and that Z is the ONLY one
+    this anchor will ever produce — no further candidate search runs off
+    it, it just waits (until TP/SL/expiry) for a retest. Once resolved,
+    the search goes back to a fresh 0-candle search, forgetting every
+    pivot tracked during the just-finished cycle. Returns every zone this
+    side ever confirmed, chronologically."""
+    n = len(candles)
+    pivot_type = "low" if is_long else "high"
+
+    def leg_pct(anchor: dict, candidate: dict) -> float:
+        # Stage 2 leg (candle 1 -> Z), CLOSE-based: for BUY, candle 1 is a
+        # HIGH and Z a LOW (a fall); for SELL, candle 1 is a LOW and Z a
+        # HIGH (a rise). Denominator is always the earlier point (candle 1).
+        ref = anchor["close"]
+        extreme = candidate["close"]
+        if not ref:
+            return 0.0
+        return (ref - extreme) / ref if is_long else (extreme - ref) / ref
+
+    def zero_leg_pct(zero: dict, stage1_pt: dict) -> float:
+        # Stage 1 leg (0 candle -> candle 1), CLOSE-based — the OPPOSITE
+        # direction from stage 2 above: for BUY, the 0 candle is a LOW and
+        # candle 1 a HIGH (a rise); for SELL, the 0 candle is a HIGH and
+        # candle 1 a LOW (a fall). Denominator is always the earlier point
+        # (the 0 candle).
+        ref = zero["close"]
+        extreme = stage1_pt["close"]
+        if not ref:
+            return 0.0
+        return (extreme - ref) / ref if is_long else (ref - extreme) / ref
+
+    cycle_pivot_low_idx: int | None = None   # lowest confirmed pivot low seen since the last reset
+    cycle_pivot_high_idx: int | None = None  # highest confirmed pivot high seen since the last reset
+
+    zero_idx: int | None = None            # this cycle's current 0 candle (a confirmed pivot)
+    stage1_extreme: dict | None = None     # chasing candle 1 from the 0 candle
+    stage1_extreme_idx: int | None = None
+
+    anchor: dict | None = None             # candle 1, once stage 1 primes
+    anchor_idx: int | None = None
+    last_cycle_anchor_idx: int | None = None  # candle 1 the most recently RESOLVED cycle used
+    pending_zero_at: int | None = None     # this cycle's own 0 candle, captured once candle 1 locks
+    pending_zero_price: float | None = None
+
+    candidate: dict | None = None          # chasing Z from candle 1
+    candidate_idx: int | None = None
+    primed = False
+
+    zone_confirmed_this_cycle = False  # freezes the whole chain once a zone actually CONFIRMS
+    zone: dict | None = None
+    history: list[dict] = []
 
     for idx in range(1, n):
         c = candles[idx]
 
-        # 0. Advance both sides' current live trade using this candle —
-        #    independent of whichever tracking phase the detector is in
-        #    below, and independent of each other. Only replaced once the
-        #    matching side's NEXT swing point actually confirms (steps 2/3).
-        _advance_zone(long_zone, c, idx, max_zone_age)
-        _advance_zone(short_zone, c, idx, max_zone_age)
+        was_live = zone is not None and zone["state"] in LIVE_STATES
+        _advance_zone(zone, c, idx, max_zone_age)
+        if was_live and zone is not None and zone["state"] not in LIVE_STATES:
+            # Cycle just resolved — go back to a fresh 0-candle search;
+            # the next cycle's pivot tracking starts over from scratch too
+            # (a new "highest/lowest pivot of THIS swing", not carried
+            # over from before).
+            last_cycle_anchor_idx = anchor_idx
+            cycle_pivot_low_idx, cycle_pivot_high_idx = None, None
+            zero_idx = None
+            stage1_extreme, stage1_extreme_idx = None, None
+            anchor, anchor_idx = None, None
+            pending_zero_at, pending_zero_price = None, None
+            candidate, candidate_idx = None, None
+            primed = False
+            zone_confirmed_this_cycle = False
 
-        # 1. Bootstrap — no swing point has ever been confirmed yet, so
-        #    there's no fixed anchor to track from. Track the running peak
-        #    AND running trough simultaneously; whichever leg reaches
-        #    SWING_THRESHOLD first fixes the opposite extreme as the
-        #    anchor and commits the detector to that direction — that leg
-        #    IS the anchor->candidate leg, so the very first candidate is
-        #    already primed the moment a mode is chosen. A candle that
-        #    just became the new running peak/trough can't also be the
-        #    move that crosses the threshold off itself (same-day
-        #    exclusion), same as the checks below.
-        if mode is None:
-            if c["high"] > boot_peak["high"]:
-                boot_peak, boot_peak_idx = c, idx
-            if c["low"] < boot_trough["low"]:
-                boot_trough, boot_trough_idx = c, idx
-            fall_pct = (boot_peak["high"] - c["low"]) / boot_peak["high"] if boot_peak["high"] else 0.0
-            rise_pct = (c["high"] - boot_trough["low"]) / boot_trough["low"] if boot_trough["low"] else 0.0
-            if fall_pct >= swing_threshold and boot_peak_idx != idx:
-                mode = "tracking_low"
-                anchor, anchor_idx = boot_peak, boot_peak_idx
-                candidate, candidate_idx = c, idx
-                primed = True
-            elif rise_pct >= swing_threshold and boot_trough_idx != idx:
-                mode = "tracking_high"
-                anchor, anchor_idx = boot_trough, boot_trough_idx
-                candidate, candidate_idx = c, idx
-                primed = True
+        # Recognize a freshly-CONFIRMED fractal pivot — a pivot at
+        # idx-PIVOT_STRENGTH only becomes recognizable once idx exists
+        # (needs PIVOT_STRENGTH confirming candles on its right). Only
+        # accepted if it's MORE extreme than whatever's already tracked
+        # this cycle — a "Lower High" (SELL) / "Higher Low" (BUY) pivot
+        # is skipped entirely, so the 0 candle only ever advances to a
+        # genuine new Higher High / Lower Low, never backslides to a
+        # weaker, merely-more-recent one.
+        check_idx = idx - PIVOT_STRENGTH
+        if check_idx - PIVOT_STRENGTH >= 0:
+            if _is_pivot_low(candles, check_idx, PIVOT_STRENGTH):
+                if cycle_pivot_low_idx is None or candles[check_idx]["close"] < candles[cycle_pivot_low_idx]["close"]:
+                    cycle_pivot_low_idx = check_idx
+            if _is_pivot_high(candles, check_idx, PIVOT_STRENGTH):
+                if cycle_pivot_high_idx is None or candles[check_idx]["close"] > candles[cycle_pivot_high_idx]["close"]:
+                    cycle_pivot_high_idx = check_idx
+
+        current_zero_idx = cycle_pivot_low_idx if is_long else cycle_pivot_high_idx
+
+        if not zone_confirmed_this_cycle and current_zero_idx is not None and current_zero_idx != zero_idx:
+            # A fresher pivot than whatever's currently backing this
+            # search — restart the ENTIRE 0->1->Z chase from it. Nothing
+            # downstream has confirmed yet, so nothing is lost that
+            # actually mattered (priming candle 1 or Z is only an
+            # eligibility gate, not a commitment).
+            if last_cycle_anchor_idx is None or current_zero_idx != last_cycle_anchor_idx:
+                zero_idx = current_zero_idx
+                stage1_extreme, stage1_extreme_idx = None, None
+                anchor, anchor_idx = None, None
+                candidate, candidate_idx = None, None
+                primed = False
             continue
 
-        # 2. TRACKING_LOW — anchor (a swing high) is fixed; the candidate
-        #    (running low) starts completely fresh after a flip (not
-        #    seeded from the candle that just confirmed the prior swing
-        #    high) and updates to a strictly lower low each time (Rule
-        #    4.1), re-checking "primed" against it. It only becomes
-        #    eligible for confirmation once SOME later candle's low is
-        #    itself >= swing_threshold below the anchor — a shallow dip
-        #    that never gets that far never counts as a candidate at all,
-        #    however long the detector waits for one that does. Once
-        #    primed, confirmation is wick-based: a LATER candle's HIGH
-        #    recovering >= threshold above the candidate's own low.
-        if mode == "tracking_low":
-            if candidate is None or c["low"] < candidate["low"]:
-                candidate, candidate_idx = c, idx
-                primed = leg_into_candidate_pct() >= swing_threshold
-                continue
-            if primed:
-                cand_ref = candidate["low"]
-                move_pct = (c["close"] - cand_ref) / cand_ref if cand_ref else 0.0
-                if cand_ref and move_pct >= swing_threshold:
-                    new_zone = _make_zone(
-                        anchor, anchor_idx, candidate, candidate_idx,
-                        "low", move_pct, idx, c["close"], sl_pct, tp_pct,
-                    )
-                    # "0 candle" (diagram point 0) — the prior extreme that
-                    # validated THIS zone's own anchor (point 1) via its own
-                    # qualifying leg. That's exactly the anchor of whichever
-                    # zone confirmed immediately before this one in the chain.
-                    if history:
-                        new_zone["zeroth_at"] = history[-1]["anchor_at"]
-                        new_zone["zeroth_price"] = history[-1]["anchor_price"]
-                    else:
-                        new_zone["zeroth_at"] = None
-                        new_zone["zeroth_price"] = None
-                    history.append(new_zone)
-                    long_zone = new_zone
-                    anchor, anchor_idx = candidate, candidate_idx
-                    mode = "tracking_high"
-                    # Start the next candidate completely fresh — do NOT
-                    # reuse this confirming candle's own high, since it's
-                    # by definition already >= threshold above the new
-                    # anchor (that's what confirmation just required) and
-                    # would make the new phase's "primed" gate a no-op.
+        if zero_idx is None:
+            continue  # no confirmed pivot yet to serve as a 0 candle
+
+        if not zone_confirmed_this_cycle and idx > zero_idx:
+            # STAGE 1 — chase candle 1 from the 0 candle, extending to any
+            # new, more extreme point (Rule 4.1) for as long as NOTHING has
+            # actually CONFIRMED yet — exactly the same "keep re-basing
+            # until confirmed, not just until primed" rule the 0 candle
+            # itself follows. A candle that doesn't extend this iteration
+            # falls through to stage 2 below instead (it might still work
+            # as a Z candidate against whatever candle 1 currently is).
+            zero = candles[zero_idx]
+            is_new_stage1 = stage1_extreme is None or (
+                c["close"] > stage1_extreme["close"] if is_long else c["close"] < stage1_extreme["close"]
+            )
+            if is_new_stage1:
+                stage1_extreme, stage1_extreme_idx = c, idx
+                if zero_leg_pct(zero, stage1_extreme) >= swing_threshold and not (
+                    last_cycle_anchor_idx is not None and stage1_extreme_idx == last_cycle_anchor_idx
+                ):
+                    # (Re-)lock candle 1 onto this deeper/higher extreme —
+                    # discarding any not-yet-confirmed Z-search progress
+                    # measured against whatever candle 1 used to be.
+                    anchor, anchor_idx = stage1_extreme, stage1_extreme_idx
+                    pending_zero_at, pending_zero_price = zero_idx, zero["close"]
                     candidate, candidate_idx = None, None
                     primed = False
+                continue
+
+        if anchor is None:
+            continue  # stage 1 hasn't primed even once yet
+
+        if idx <= anchor_idx:
+            continue  # Z can never be at or before its own candle 1
+
+        if zone_confirmed_this_cycle:
+            continue  # only ONE Z per anchor cycle — just wait for it to resolve (top of loop)
+
+        # STAGE 2 — chase Z from candle 1, CLOSE-based (same mechanics as
+        # before, just close instead of wick).
+        is_new_candidate = candidate is None or (
+            c["close"] < candidate["close"] if is_long else c["close"] > candidate["close"]
+        )
+        if is_new_candidate:
+            candidate, candidate_idx = c, idx
+            primed = leg_pct(anchor, candidate) >= swing_threshold
             continue
 
-        # 3. TRACKING_HIGH — the mirror. A confirmed swing high arms a
-        #    tradeable SHORT zone the same way a swing low arms LONG.
-        if mode == "tracking_high":
-            if candidate is None or c["high"] > candidate["high"]:
-                candidate, candidate_idx = c, idx
-                primed = leg_into_candidate_pct() >= swing_threshold
-                continue
-            if primed:
-                cand_ref = candidate["high"]
-                move_pct = (cand_ref - c["close"]) / cand_ref if cand_ref else 0.0
-                if cand_ref and move_pct >= swing_threshold:
-                    new_zone = _make_zone(
-                        anchor, anchor_idx, candidate, candidate_idx,
-                        "high", move_pct, idx, c["close"], sl_pct, tp_pct,
-                    )
-                    # Same "0 candle" derivation as the tracking_low branch above.
-                    if history:
-                        new_zone["zeroth_at"] = history[-1]["anchor_at"]
-                        new_zone["zeroth_price"] = history[-1]["anchor_price"]
-                    else:
-                        new_zone["zeroth_at"] = None
-                        new_zone["zeroth_price"] = None
-                    history.append(new_zone)
-                    short_zone = new_zone
-                    anchor, anchor_idx = candidate, candidate_idx
-                    mode = "tracking_low"
-                    # Same fresh-start reset as the tracking_low->tracking_high flip above.
-                    candidate, candidate_idx = None, None
-                    primed = False
+        if not primed:
             continue
+
+        cand_ref = candidate["close"]
+        move_pct = (
+            (c["close"] - cand_ref) / cand_ref if is_long
+            else (cand_ref - c["close"]) / cand_ref
+        ) if cand_ref else 0.0
+        if not (cand_ref and move_pct >= swing_threshold):
+            continue
+
+        new_zone = _make_zone(
+            anchor, anchor_idx, candidate, candidate_idx,
+            pivot_type, move_pct, idx, c["close"], sl_pct, tp_pct,
+        )
+        # "0 candle" — this cycle's own pivot, captured when candle 1
+        # locked (see stage 1 above).
+        new_zone["zeroth_at"] = pending_zero_at
+        new_zone["zeroth_price"] = pending_zero_price
+        history.append(new_zone)
+        zone = new_zone
+        # The whole chain (0 candle, candle 1, Z) is now permanently
+        # frozen for the rest of this cycle — a zone has actually
+        # CONFIRMED off it, not merely primed. This is also the ONLY Z
+        # this anchor will ever produce — no further candidate search
+        # runs until this exact zone resolves (top of loop), no matter
+        # how long that takes; it just waits for a retest.
+        zone_confirmed_this_cycle = True
 
     return history
 
@@ -431,9 +588,11 @@ def _confirm_predicate(reference: float, direction: str, swing_threshold: float)
 
 
 def _touch_predicate(z: float, direction: str):
+    # Entry is CLOSE-based, same as every other detection stage (SL/TP
+    # resolution is the only wick-based check — see _resolution_predicate).
     if direction == "LONG":
-        return lambda row: row["low"] <= z
-    return lambda row: row["high"] >= z
+        return lambda row: row["close"] <= z
+    return lambda row: row["close"] >= z
 
 
 async def _refine_extreme_moment(
@@ -442,12 +601,13 @@ async def _refine_extreme_moment(
     """Pinpoints WHEN during a day its own extreme (the opposing-side
     anchor, or the swing low/high candidate) was actually printed — using
     whichever finer interval tier is available, picking the row with the
-    max high (seeking_high=True) or min low (seeking_high=False). Falls
-    back to the day's own open_time if no finer data covers it."""
+    max close (seeking_high=True) or min close (seeking_high=False),
+    matching close-based detection. Falls back to the day's own open_time
+    if no finer data covers it."""
     rows = await _fetch_finest_available_rows(db, symbol, market, day_open_time)
     if not rows:
         return day_open_time
-    best = max(rows, key=lambda r: r["high"]) if seeking_high else min(rows, key=lambda r: r["low"])
+    best = max(rows, key=lambda r: r["close"]) if seeking_high else min(rows, key=lambda r: r["close"])
     return best["open_time"]
 
 
@@ -514,22 +674,19 @@ async def _build_zone_row(
         candidate_day = candles[zone["candidate_at"]]["open_time"]
         candidate_time = await _refine_extreme_moment(db, symbol, market, candidate_day, seeking_high=(direction == "SHORT"))
 
-        # "0 candle" (diagram point 0) — the prior extreme that
-        # validated this zone's own anchor. None for the very first
-        # zone ever detected for this coin (nothing before the start
-        # of stored history to validate against). Opposite seeking_high
-        # from this zone's own anchor, since it's the anchor of the
-        # OPPOSITE-direction zone that came immediately before it.
-        zeroth_time = None
-        if zone.get("zeroth_at") is not None:
-            zeroth_day = candles[zone["zeroth_at"]]["open_time"]
-            zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
+        # "0 candle" (diagram point 0) — this zone's own most-recently-
+        # confirmed local swing pivot that validated its candle 1 (see
+        # _is_pivot_low/High in swing_strategy.py), a trough for LONG, a
+        # peak for SHORT — opposite seeking_high from this zone's own
+        # anchor, since it's the opposite type of extreme.
+        zeroth_day = candles[zone["zeroth_at"]]["open_time"]
+        zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
 
     return {
         "symbol": symbol,
         "direction": direction,
         "state": zone["state"],
-        "zeroth_time": zeroth_time,       # diagram point 0 — the prior extreme validating the anchor
+        "zeroth_time": zeroth_time,       # diagram point 0 — this zone's own confirming pivot
         "zeroth_price": zone.get("zeroth_price"),
         "anchor_time": anchor_time,      # diagram point 1 — the opposing extreme
         "anchor_price": zone["anchor_price"],
@@ -646,9 +803,7 @@ async def _build_trade(
         detected_at = confirm_day
         anchor_time = candles[zone["anchor_at"]]["open_time"]
         candidate_time = candles[zone["candidate_at"]]["open_time"]
-        zeroth_time = (
-            candles[zone["zeroth_at"]]["open_time"] if zone.get("zeroth_at") is not None else None
-        )
+        zeroth_time = candles[zone["zeroth_at"]]["open_time"]
     else:
         async with AsyncSessionLocal() as db:
             entry_time = await _refine_moment(db, symbol, market, entry_day, _touch_predicate(zone["z"], direction))
@@ -664,13 +819,10 @@ async def _build_trade(
             else:
                 exit_time = None
 
-            # "0 candle" (diagram point 0) — same derivation as the live
-            # dashboard. None for a coin's very first zone ever (no prior
-            # extreme exists before the start of stored history).
-            zeroth_time = None
-            if zone.get("zeroth_at") is not None:
-                zeroth_day = candles[zone["zeroth_at"]]["open_time"]
-                zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
+            # "0 candle" (diagram point 0) — same confirming-pivot
+            # derivation as the live dashboard.
+            zeroth_day = candles[zone["zeroth_at"]]["open_time"]
+            zeroth_time = await _refine_extreme_moment(db, symbol, market, zeroth_day, seeking_high=(direction == "SHORT"))
 
             # Same 4-point timeline as the live dashboard (see
             # scan_swing_zones): anchor (point 1), candidate/Z (point 2),
